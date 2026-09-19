@@ -1,0 +1,6 @@
+.idea/
+.vscode/
+build/
+*.aar
+libclash-sources.jar
+__pycache__/
