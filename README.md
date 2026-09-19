@@ -122,4 +122,4 @@ updating. CI builds do not substitute for Android device regression testing.
 
 ## License
 
-GPL-3.0. See `LICENSE` and `NOTICE` for source provenance and attribution.
+Original contributions in this repository are licensed under [LGPL-3.0](LICENSE). Upstream and third-party code retain their respective licenses.
