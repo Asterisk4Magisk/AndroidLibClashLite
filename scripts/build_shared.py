@@ -85,10 +85,9 @@ def build(args, work):
     env = os.environ.copy()
     for name in ('GOOS', 'GOARCH', 'GOARM', 'CC', 'CXX', 'CGO_ENABLED'):
         env.pop(name, None)
-    temp = pathlib.Path('C:/Temp') if os.name == 'nt' else work / 'tmp'
+    temp = work / 'tmp'
     temp.mkdir(parents=True, exist_ok=True)
     env.update(TEMP=str(temp), TMP=str(temp), TMPDIR=str(temp))
-    env['JAVA_TOOL_OPTIONS'] = env.get('JAVA_TOOL_OPTIONS', '') + f' -Djava.io.tmpdir="{temp}"'
     ndk = pathlib.Path(env['ANDROID_NDK_HOME']).resolve()
     host = {'Windows': 'windows-x86_64', 'Linux': 'linux-x86_64', 'Darwin': 'darwin-x86_64'}[platform.system()]
     suffix = '.exe' if os.name == 'nt' else ''
@@ -172,9 +171,7 @@ def main():
         work.mkdir(parents=True, exist_ok=True)
         build(args, work)
     else:
-        if os.name == 'nt':
-            pathlib.Path('C:/Temp').mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix='clash-shared-', dir='C:/Temp' if os.name == 'nt' else None) as directory:
+        with tempfile.TemporaryDirectory(prefix='clash-shared-') as directory:
             build(args, pathlib.Path(directory))
 
 

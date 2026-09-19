@@ -16,8 +16,8 @@ python scripts/build_shared.py
 Outputs: `libclash.aar` and `libclash-sources.jar`. The default build includes
 armeabi-v7a, arm64-v8a, x86 and x86_64 at API 26 with 16 KB ELF alignment. Use
 `--arch amd64` for one ABI, `--output <file.aar>` to select an output, or
-`--work-dir <directory>` to retain generated sources and logs. On Windows,
-temporary files use `C:\Temp`. Set `SOURCE_DATE_EPOCH` for a fixed build timestamp.
+`--work-dir <directory>` to retain generated sources and logs.
+Set `SOURCE_DATE_EPOCH` for a fixed build timestamp.
 Builds do not require an application checkout or modify the Go module cache.
 
 Each ABI contains only:
