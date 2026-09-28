@@ -48,6 +48,12 @@ func Init(home, appVersion string, sdkVersion int32, resolver ContentResolver) e
 
 func CoreVersion() string { return constant.Version }
 
+// NotifyInstalledAppsChanged replaces the UID/package mapping used by Android
+// PROCESS-NAME rules. Entries use the form "10001:com.example.app,10002:...".
+func NotifyInstalledAppsChanged(uidList string) {
+	app.NotifyInstallAppsChanged(uidList)
+}
+
 func Reset() {
 	config.LoadDefault()
 	tunnel.ResetStatistic()

@@ -50,17 +50,11 @@ func QueryProviders() []*Provider {
 	result := make([]*Provider, 0, len(providers))
 
 	for _, p := range providers {
-		updatedAt := time.Time{}
-
-		if s, ok := p.(UpdatableProvider); ok {
-			updatedAt = s.UpdatedAt()
-		}
-
 		result = append(result, &Provider{
 			Name:        p.Name(),
 			VehicleType: p.VehicleType().String(),
 			Type:        p.Type().String(),
-			UpdatedAt:   updatedAt.UnixNano() / 1000 / 1000,
+			UpdatedAt:   providerUpdatedAt(p, nil),
 		})
 	}
 
@@ -79,19 +73,10 @@ func QueryProvider(t string, name string, uiSubtitlePattern *regexp2.Regexp) (ma
 		if payload, err := json.Marshal(p); err == nil {
 			_ = json.Unmarshal(payload, &detail)
 		}
-		updatedAt := time.Time{}
-		if s, ok := p.(UpdatableProvider); ok {
-			updatedAt = s.UpdatedAt()
-		} else if value, ok := detail["updatedAt"].(string); ok {
-			if parsed, err := time.Parse(time.RFC3339Nano, value); err == nil {
-				updatedAt = parsed
-			}
-		}
-
 		detail["name"] = p.Name()
 		detail["vehicleType"] = p.VehicleType().String()
 		detail["type"] = p.Type().String()
-		detail["updatedAt"] = updatedAt.UnixNano() / 1000 / 1000
+		detail["updatedAt"] = providerUpdatedAt(p, detail)
 		detail["proxies"] = convertProxies(p.Proxies(), uiSubtitlePattern)
 		detail["testUrl"] = p.HealthCheckURL()
 		return detail, nil
@@ -105,19 +90,39 @@ func QueryProvider(t string, name string, uiSubtitlePattern *regexp2.Regexp) (ma
 		if payload, err := json.Marshal(p); err == nil {
 			_ = json.Unmarshal(payload, &detail)
 		}
-		updatedAt := time.Time{}
-		if s, ok := p.(UpdatableProvider); ok {
-			updatedAt = s.UpdatedAt()
-		}
-
 		detail["name"] = p.Name()
 		detail["vehicleType"] = p.VehicleType().String()
 		detail["type"] = p.Type().String()
-		detail["updatedAt"] = updatedAt.UnixNano() / 1000 / 1000
+		detail["updatedAt"] = providerUpdatedAt(p, detail)
 		return detail, nil
 	default:
 		return nil, ErrInvalidType
 	}
+}
+
+func providerUpdatedAt(p provider.Provider, detail map[string]any) int64 {
+	var updatedAt time.Time
+	if s, ok := p.(UpdatableProvider); ok {
+		updatedAt = s.UpdatedAt()
+	} else if detail != nil {
+		if value, ok := detail["updatedAt"].(string); ok {
+			updatedAt, _ = time.Parse(time.RFC3339Nano, value)
+		}
+	} else {
+		// Inline providers expose their timestamp only through MarshalJSON.
+		var metadata struct {
+			UpdatedAt time.Time `json:"updatedAt"`
+		}
+		if payload, err := json.Marshal(p); err == nil {
+			if json.Unmarshal(payload, &metadata) == nil {
+				updatedAt = metadata.UpdatedAt
+			}
+		}
+	}
+	if updatedAt.IsZero() {
+		return 0
+	}
+	return updatedAt.UnixMilli()
 }
 
 func UpdateProvider(t string, name string) error {

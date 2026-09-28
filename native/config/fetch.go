@@ -86,6 +86,9 @@ func openContent(url string) (io.ReadCloser, error) {
 }
 
 func fetch(ctx context.Context, url *U.URL, file string, userAgent string, requestDialer C.Dialer) (fetchHeader, error) {
+	if err := ctx.Err(); err != nil {
+		return fetchHeader{}, err
+	}
 	requestCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 
@@ -97,6 +100,8 @@ func fetch(ctx context.Context, url *U.URL, file string, userAgent string, reque
 	case "http", "https":
 		reader, header, err = openUrl(requestCtx, url.String(), userAgent, requestDialer)
 	case "content":
+		// Descriptor acquisition is synchronous in the Android resolver API.
+		// Once acquired, closing the descriptor can interrupt a blocked read.
 		reader, err = openContent(url.String())
 	default:
 		err = fmt.Errorf("unsupported scheme %s of %s", url.Scheme, url)
@@ -108,7 +113,19 @@ func fetch(ctx context.Context, url *U.URL, file string, userAgent string, reque
 
 	defer reader.Close()
 
-	return header, writeFile(file, reader)
+	if err := requestCtx.Err(); err != nil {
+		return header, err
+	}
+	if url.Scheme == "content" {
+		stop := context.AfterFunc(requestCtx, func() { _ = reader.Close() })
+		defer stop()
+	}
+
+	err = writeFile(file, reader)
+	if ctxErr := requestCtx.Err(); ctxErr != nil {
+		return header, ctxErr
+	}
+	return header, err
 }
 
 func fetchProvider(
@@ -268,6 +285,7 @@ func FetchAndValid(
 	}
 
 	providerErrors := make([]error, 0)
+	payloadFetchErrors := make(map[string]error)
 	forEachProviders(rawCfg, func(index int, total int, name string, provider map[string]any, prefix string) {
 		if err := ctx.Err(); err != nil {
 			providerErrors = append(providerErrors, err)
@@ -331,7 +349,14 @@ func FetchAndValid(
 				cachefile.Cache().SetSubscriptionInfo(name, value)
 			},
 		); err != nil {
-			providerErrors = append(providerErrors, fmt.Errorf("fetch provider %s: %w", name, err))
+			fetchErr := fmt.Errorf("fetch provider %s: %w", name, err)
+			if prefix == PROXIES && provider["type"] == "http" && provider["payload"] != nil {
+				// Let the core validate an explicitly configured fallback payload.
+				// A payload's presence alone does not mean it contains usable proxies.
+				payloadFetchErrors[name] = fetchErr
+			} else {
+				providerErrors = append(providerErrors, fetchErr)
+			}
 		}
 	})
 	if err := errors.Join(providerErrors...); err != nil {
@@ -354,10 +379,19 @@ func FetchAndValid(
 	if err != nil {
 		return err
 	}
+	defer destroyProviders(cfg)
 
-	destroyProviders(cfg)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	for name, fetchErr := range payloadFetchErrors {
+		fallback := cfg.Providers[name]
+		if fallback == nil || len(fallback.Proxies()) == 0 {
+			providerErrors = append(providerErrors, fetchErr)
+		}
+	}
 
-	return nil
+	return errors.Join(providerErrors...)
 }
 
 func (options FetchOptions) requestDialer() (C.Dialer, error) {

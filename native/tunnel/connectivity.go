@@ -84,9 +84,8 @@ func QueryGroupDelay(name string, url string, timeoutMillis int, expectedStatusT
 	defer cancel()
 
 	delays, err := group.URLTest(ctx, url, expectedStatus)
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
-	}
+	// Like the Clash group API, retain successful probes even when another
+	// member exhausts the shared deadline. URLTest reports an error if none succeeded.
 	if err != nil {
 		return nil, err
 	}

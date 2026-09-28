@@ -2,16 +2,21 @@ package app
 
 import (
 	"net"
+	"sync/atomic"
 	"syscall"
 
 	"cfa/native/platform"
 )
 
-var markSocketImpl func(fd int)
-var querySocketUidImpl func(protocol int, source, target string) int
+type tunContext struct {
+	markSocket     func(fd int)
+	querySocketUid func(protocol int, source, target string) int
+}
+
+var currentTunContext atomic.Pointer[tunContext]
 
 func MarkSocket(fd int) {
-	markSocketImpl(fd)
+	currentTunContext.Load().markSocket(fd)
 }
 
 func QuerySocketUid(source, target net.Addr) int {
@@ -30,7 +35,7 @@ func QuerySocketUid(source, target net.Addr) int {
 		return platform.QuerySocketUidFromProcFs(source, target)
 	}
 
-	return querySocketUidImpl(protocol, source.String(), target.String())
+	return currentTunContext.Load().querySocketUid(protocol, source.String(), target.String())
 }
 
 func ApplyTunContext(markSocket func(fd int), querySocketUid func(int, string, string) int) {
@@ -42,8 +47,7 @@ func ApplyTunContext(markSocket func(fd int), querySocketUid func(int, string, s
 		querySocketUid = func(int, string, string) int { return -1 }
 	}
 
-	markSocketImpl = markSocket
-	querySocketUidImpl = querySocketUid
+	currentTunContext.Store(&tunContext{markSocket: markSocket, querySocketUid: querySocketUid})
 }
 
 func init() {

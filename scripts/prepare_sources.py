@@ -65,7 +65,22 @@ def prepare_sources(repo, work, core):
     patch('dns/system_common.go', 'func (c *systemClient) ResetConnection()',
           'func (c *systemClient) resetNativeConnection()')
     patch('dns/patch_android.go', 'package dns',
-          'package dns\n\nimport "github.com/metacubex/mihomo/constant/features"')
+          'package dns\n\nimport "github.com/metacubex/mihomo/constant/features"\nimport "sync/atomic"')
+    # Android network notifications race DNS exchanges and connection resets.
+    # Publish immutable slices so workers can retain a consistent snapshot.
+    patch('dns/patch_android.go', 'var systemResolver []dnsClient',
+          'var systemResolver atomic.Pointer[[]dnsClient]\n\n'
+          'func systemResolverSnapshot() []dnsClient {\n'
+          '\tif clients := systemResolver.Load(); clients != nil { return *clients }\n'
+          '\treturn nil\n}')
+    patch('dns/patch_android.go',
+          '\tif len(addr) == 0 {\n\t\tsystemResolver = nil\n\t}', '')
+    patch('dns/patch_android.go', '\tsystemResolver = transform(ns, nil)',
+          '\tclients := transform(ns, nil)\n\tsystemResolver.Store(&clients)')
+    patch('dns/patch_android.go', '\treturn systemResolver, nil',
+          '\treturn systemResolverSnapshot(), nil')
+    patch('dns/patch_android.go', '\tfor _, r := range systemResolver {',
+          '\tfor _, r := range systemResolverSnapshot() {')
     patch('dns/patch_android.go', 'func (c *systemClient) getDnsClients() ([]dnsClient, error) {',
           'func (c *systemClient) getDnsClients() ([]dnsClient, error) {\n'
           '\tif !features.CMFA { return c.getNativeDnsClients() }')

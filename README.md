@@ -44,6 +44,10 @@ and coroutine adapters. The old CMFA `Clash`/`Bridge` classes are not included.
   Callbacks run on worker threads; dispatch UI work as needed.
 - Fetch task IDs must be unique while active. `cancelFetch` requests cancellation;
   completion still fires and must be awaited before reusing task resources.
+  Cancellation of `content://` interrupts reads after descriptor acquisition;
+  the synchronous resolver open itself cannot currently be interrupted.
+- Group delay calls return partial successes, matching the Clash HTTP API;
+  an error is returned when no member succeeds.
 - `startTun` borrows the caller's descriptor and retains a duplicate. Pass
   `ParcelFileDescriptor.fd`, then close the original after the call on both
   success and failure. `stopTun` closes the core's duplicate. Socket protection
@@ -52,13 +56,20 @@ and coroutine adapters. The old CMFA `Clash`/`Bridge` classes are not included.
   use `detachFd()` here. The core closes it after reading.
 - `subscribeLogcat` returns an idempotent, closable subscription. Close it when
   the consumer stops, including when no logs are arriving.
+- `notifyInstalledAppsChanged` replaces the complete `uid:package` CSV snapshot
+  used by Android PROCESS-NAME rules. Send it after initialization and package
+  changes. `notifyDnsChanged` replaces the underlying non-VPN network's DNS
+  servers as comma-separated `IP:port` endpoints (bracket IPv6 addresses).
+  Send an empty string when no underlying DNS servers remain; never feed the
+  VPN's own DNS endpoint back into this API. Both notifications are thread-safe.
 - Traffic queries return separate 64-bit upload/download counters. Config,
   proxy, provider and connection queries retain JSON payloads. AGE decryption
   returns plaintext or throws an exception.
 
 The exported surface covers META's current configuration, subscription, TUN,
-logging, traffic, proxy/provider and AGE operations. Unused legacy notification,
-HTTP-forwarder, health-check and key-generation entry points are omitted.
+logging, traffic, proxy/provider, Android platform notifications and AGE
+operations. Unused HTTP-forwarder, health-check and key-generation entry points
+are omitted.
 
 ## Standalone CLI
 

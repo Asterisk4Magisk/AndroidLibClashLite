@@ -3,6 +3,7 @@ package config
 import (
 	"io"
 	"os"
+	"sync/atomic"
 
 	"github.com/metacubex/mihomo/constant"
 )
@@ -17,7 +18,7 @@ const (
 const defaultPersistOverride = `{}`
 const defaultSessionOverride = `{}`
 
-var sessionOverride = defaultSessionOverride
+var sessionOverride atomic.Value // string; nil means the default override
 
 func overridePersistPath() string {
 	return constant.Path.Resolve("override.json")
@@ -30,6 +31,7 @@ func ReadOverride(slot OverrideSlot) string {
 		if err != nil {
 			return defaultPersistOverride
 		}
+		defer file.Close()
 
 		buf, err := io.ReadAll(file)
 		if err != nil {
@@ -38,7 +40,10 @@ func ReadOverride(slot OverrideSlot) string {
 
 		return string(buf)
 	case OverrideSlotSession:
-		return sessionOverride
+		if value := sessionOverride.Load(); value != nil {
+			return value.(string)
+		}
+		return defaultSessionOverride
 	}
 
 	return ""
@@ -51,10 +56,11 @@ func WriteOverride(slot OverrideSlot, content string) {
 		if err != nil {
 			return
 		}
+		defer file.Close()
 
 		_, err = file.Write([]byte(content))
 	case OverrideSlotSession:
-		sessionOverride = content
+		sessionOverride.Store(content)
 	}
 }
 
@@ -63,6 +69,6 @@ func ClearOverride(slot OverrideSlot) {
 	case OverrideSlotPersist:
 		_ = os.Remove(overridePersistPath())
 	case OverrideSlotSession:
-		sessionOverride = defaultSessionOverride
+		sessionOverride.Store(defaultSessionOverride)
 	}
 }

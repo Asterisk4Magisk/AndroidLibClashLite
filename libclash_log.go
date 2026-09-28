@@ -18,7 +18,13 @@ type LogSubscription struct {
 }
 
 // Close is nonblocking and safe to call from Received.
-func (s *LogSubscription) Close() { s.once.Do(func() { close(s.done) }) }
+func (s *LogSubscription) Close() {
+	s.once.Do(func() {
+		if s.done != nil {
+			close(s.done)
+		}
+	})
+}
 
 func SubscribeLogcat(callback LogcatInterface) (*LogSubscription, error) {
 	if callback == nil {
