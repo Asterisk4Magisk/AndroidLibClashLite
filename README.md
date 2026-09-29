@@ -46,6 +46,15 @@ and coroutine adapters. The old CMFA `Clash`/`Bridge` classes are not included.
   completion still fires and must be awaited before reusing task resources.
   Cancellation of `content://` interrupts reads after descriptor acquisition;
   the synchronous resolver open itself cannot currently be interrupted.
+- `supportsSubscriptionHwid()` identifies bindings with HWID support. The fetch
+  options JSON accepts `hwid` (empty means omitted). Nonempty values must match
+  `[a-zA-Z0-9=-]{10,64}` and apply only to the primary HTTP subscription, never
+  automatically to providers. Same-origin redirects retain identity; crossing
+  origins strips it for the rest of the chain. HTTPS downgrades are rejected.
+  HWID refusal headers are checked before consuming the response body, including
+  HTTP 200 denials. Completion errors use `HWID_INVALID`, `HWID_NOT_SUPPORTED`,
+  or `HWID_LIMIT_REACHED`; clients should localize these stable codes. The library
+  does not generate or persist device identifiers.
 - Group delay calls return partial successes, matching the Clash HTTP API;
   an error is returned when no member succeeds.
 - `startTun` borrows the caller's descriptor and retains a duplicate. Pass

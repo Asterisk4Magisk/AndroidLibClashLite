@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	U "net/url"
 	"os"
 	P "path"
@@ -17,10 +16,10 @@ import (
 
 	"cfa/native/app"
 
+	"cfa/native/subscription"
 	A "github.com/metacubex/mihomo/adapter/outbound"
 	"github.com/metacubex/mihomo/adapter/provider"
 	"github.com/metacubex/mihomo/component/dialer"
-	clashHttp "github.com/metacubex/mihomo/component/http"
 	"github.com/metacubex/mihomo/component/profile/cachefile"
 	"github.com/metacubex/mihomo/component/proxydialer"
 	C "github.com/metacubex/mihomo/constant"
@@ -37,6 +36,7 @@ type FetchProxy struct {
 type FetchOptions struct {
 	Force     bool        `json:"force"`
 	UserAgent string      `json:"userAgent"`
+	Hwid      string      `json:"hwid"`
 	Proxy     *FetchProxy `json:"proxy"`
 }
 
@@ -57,22 +57,10 @@ type fetchHeader struct {
 	ProfileUpdateInterval string
 }
 
-func openUrl(ctx context.Context, url string, userAgent string, requestDialer C.Dialer) (io.ReadCloser, fetchHeader, error) {
-	response, err := clashHttp.HttpRequest(
-		ctx,
-		url,
-		http.MethodGet,
-		http.Header{"User-Agent": {userAgent}},
-		nil,
-		clashHttp.WithDialer(requestDialer),
-	)
-
+func openUrl(ctx context.Context, url string, userAgent string, hwid string, requestDialer C.Dialer) (io.ReadCloser, fetchHeader, error) {
+	response, err := subscription.Get(ctx, url, userAgent, hwid, requestDialer.DialContext)
 	if err != nil {
 		return nil, fetchHeader{}, err
-	}
-	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		_ = response.Body.Close()
-		return nil, fetchHeader{}, fmt.Errorf("HTTP %d", response.StatusCode)
 	}
 
 	return response.Body, fetchHeader{
@@ -85,7 +73,7 @@ func openContent(url string) (io.ReadCloser, error) {
 	return app.OpenContent(url)
 }
 
-func fetch(ctx context.Context, url *U.URL, file string, userAgent string, requestDialer C.Dialer) (fetchHeader, error) {
+func fetch(ctx context.Context, url *U.URL, file string, userAgent string, hwid string, requestDialer C.Dialer) (fetchHeader, error) {
 	if err := ctx.Err(); err != nil {
 		return fetchHeader{}, err
 	}
@@ -98,7 +86,7 @@ func fetch(ctx context.Context, url *U.URL, file string, userAgent string, reque
 
 	switch url.Scheme {
 	case "http", "https":
-		reader, header, err = openUrl(requestCtx, url.String(), userAgent, requestDialer)
+		reader, header, err = openUrl(requestCtx, url.String(), userAgent, hwid, requestDialer)
 	case "content":
 		// Descriptor acquisition is synchronous in the Android resolver API.
 		// Once acquired, closing the descriptor can interrupt a blocked read.
@@ -244,7 +232,7 @@ func FetchAndValid(
 
 		reportStatus(string(bytes))
 
-		header, err := fetch(ctx, url, configPath, mainUserAgent, requestDialer)
+		header, err := fetch(ctx, url, configPath, mainUserAgent, options.Hwid, requestDialer)
 		if err != nil {
 			return err
 		}
@@ -343,7 +331,7 @@ func FetchAndValid(
 			prefix,
 			name,
 			func() (fetchHeader, error) {
-				return fetch(ctx, url, ps, defaultUserAgent, requestDialer)
+				return fetch(ctx, url, ps, defaultUserAgent, "", requestDialer)
 			},
 			func(name string, value string) {
 				cachefile.Cache().SetSubscriptionInfo(name, value)
