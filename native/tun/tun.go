@@ -2,6 +2,7 @@ package tun
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -14,9 +15,31 @@ import (
 	"github.com/metacubex/mihomo/tunnel"
 )
 
-func Start(fd int, stack, gateway, portal, dns string) (io.Closer, error) {
-	log.Debugln("TUN: fd = %d, stack = %s, gateway = %s, portal = %s, dns = %s", fd, stack, gateway, portal, dns)
+func Start(fd int, stack, gateway, portal, dns, congestionController string) (io.Closer, error) {
+	log.Debugln("TUN: fd = %d, stack = %s, gateway = %s, portal = %s, dns = %s, congestion-controller = %s", fd, stack, gateway, portal, dns, congestionController)
+	options, err := tunOptions(fd, stack, gateway, dns, congestionController)
+	if err != nil {
+		return nil, err
+	}
 
+	tunOptions, _ := json.Marshal(options)
+	log.Debugln("%s", tunOptions)
+
+	listener, err := sing_tun.New(options, tunnel.Tunnel)
+	if err != nil {
+		log.Errorln("TUN: %v", err)
+		return nil, err
+	}
+
+	return listener, nil
+}
+
+func tunOptions(fd int, stack, gateway, dns, congestionController string) (LC.Tun, error) {
+	switch congestionController {
+	case "", "cubic", "reno", "bbr", "bbr3":
+	default:
+		return LC.Tun{}, fmt.Errorf("invalid TCP congestion controller: %s", congestionController)
+	}
 	tunStack, ok := C.StackTypeMapping[strings.ToLower(stack)]
 	if !ok {
 		tunStack = C.TunSystem
@@ -31,8 +54,8 @@ func Start(fd int, stack, gateway, portal, dns string) (io.Closer, error) {
 		}
 		prefix, err := netip.ParsePrefix(gatewayStr)
 		if err != nil {
-			log.Errorln("TUN:", err)
-			return nil, err
+			log.Errorln("TUN: %v", err)
+			return LC.Tun{}, err
 		}
 
 		if prefix.Addr().Is4() {
@@ -51,27 +74,17 @@ func Start(fd int, stack, gateway, portal, dns string) (io.Closer, error) {
 		dnsHijack = append(dnsHijack, net.JoinHostPort(dnsStr, "53"))
 	}
 
-	options := LC.Tun{
-		Enable:              true,
-		Device:              sing_tun.InterfaceName,
-		Stack:               tunStack,
-		DNSHijack:           dnsHijack,
-		AutoRoute:           false, // had set route in TunService.kt
-		AutoDetectInterface: false, // implements by VpnService::protect
-		Inet4Address:        prefix4,
-		Inet6Address:        prefix6,
-		MTU:                 9000, // private const val TUN_MTU = 9000 in TunService.kt
-		FileDescriptor:      fd,
-	}
-
-	tunOptions, _ := json.Marshal(options)
-	log.Debugln(string(tunOptions))
-
-	listener, err := sing_tun.New(options, tunnel.Tunnel)
-	if err != nil {
-		log.Errorln("TUN:", err)
-		return nil, err
-	}
-
-	return listener, nil
+	return LC.Tun{
+		Enable:               true,
+		Device:               sing_tun.InterfaceName,
+		Stack:                tunStack,
+		CongestionController: congestionController,
+		DNSHijack:            dnsHijack,
+		AutoRoute:            false, // had set route in TunService.kt
+		AutoDetectInterface:  false, // implements by VpnService::protect
+		Inet4Address:         prefix4,
+		Inet6Address:         prefix6,
+		MTU:                  9000, // private const val TUN_MTU = 9000 in TunService.kt
+		FileDescriptor:       fd,
+	}, nil
 }

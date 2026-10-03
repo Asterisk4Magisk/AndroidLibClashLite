@@ -61,6 +61,13 @@ func (t *remoteTun) close() {
 // StartTun borrows the Android VPN descriptor and retains its own duplicate.
 // The caller must close its descriptor after this call, on success or failure.
 func StartTun(fd int32, stack, gateway, portal, dns string, callback TunInterface) error {
+	return StartTunWithCongestionController(fd, stack, gateway, portal, dns, "", callback)
+}
+
+// StartTunWithCongestionController has the same descriptor ownership and callback
+// contract as StartTun. congestionController accepts cubic, reno, bbr, bbr3, or
+// an empty string for the core default. It only takes effect with the mips stack.
+func StartTunWithCongestionController(fd int32, stack, gateway, portal, dns, congestionController string, callback TunInterface) error {
 	if fd <= 0 || callback == nil {
 		return errors.New("valid TUN fd and callback are required")
 	}
@@ -72,7 +79,7 @@ func StartTun(fd int32, stack, gateway, portal, dns string, callback TunInterfac
 	}
 	remote := &remoteTun{callback: callback, limit: semaphore.NewWeighted(4)}
 	app.ApplyTunContext(remote.markSocket, remote.querySocketUid)
-	closer, err := tun.Start(int(fd), stack, gateway, portal, dns)
+	closer, err := tun.Start(int(fd), stack, gateway, portal, dns, congestionController)
 	if err != nil {
 		remote.close()
 		return err

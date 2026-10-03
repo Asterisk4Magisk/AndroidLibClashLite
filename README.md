@@ -61,6 +61,12 @@ and coroutine adapters. The old CMFA `Clash`/`Bridge` classes are not included.
   `ParcelFileDescriptor.fd`, then close the original after the call on both
   success and failure. `stopTun` closes the core's duplicate. Socket protection
   and UID callbacks must return promptly and must not call TUN stop methods.
+- `startTunWithCongestionController(fd, stack, gateway, portal, dns,
+  congestionController, callback)` follows the same ownership and callback
+  contract as `startTun`. The extra string accepts `cubic`, `reno`, `bbr`,
+  `bbr3`, or an empty string for the core default. It only takes effect with
+  `stack = "mips"`; other stacks ignore it. Invalid values throw an exception.
+  The existing `startTun` entry point remains available and uses the core default.
 - `ContentResolver.openContent` transfers an opened descriptor to the core;
   use `detachFd()` here. The core closes it after reading.
 - `subscribeLogcat` returns an idempotent, closable subscription. Close it when
