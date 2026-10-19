@@ -131,7 +131,8 @@ asterisk-auto-switch:
   enable: true
   groups: [Proxy]              # select groups only
   preferred-filter: "(?i)HK"   # regexp2, like a group filter; optional
-  failure-threshold: 3         # 1-10 consecutive failures
+  failure-threshold: 1         # 1-10 consecutive failures
+  expected-delay: 0            # ms; stop a scan at the first delay below it, 0 tests all
   interval: 30                 # 10-3600 seconds between rounds
   url: https://www.gstatic.com/generate_204
   timeout: 5000                # 1000-30000 ms per test
@@ -146,7 +147,10 @@ received data counts as healthy without a probe (`inUse` in the group status),
 so an actively used device sends no extra test traffic; otherwise the node is
 probed with `url`. After
 the threshold, healthy members matching `preferred-filter` are preferred,
-otherwise any healthy member; the lowest delay wins within a tier. The selection
+otherwise any healthy member; the lowest delay wins within a tier. With a
+nonzero `expected-delay`, the first member answering strictly below it wins
+instead: members are probed fastest-last-result first, queued probes are
+skipped and probes already in flight finish in the background. The selection
 changes only if it is still the node that failed, so a manual choice made during
 the scan wins. A switch updates the store-selected cache and closes connections
 through the group. A scan that finds no healthy member is retried after 1, 2, 4

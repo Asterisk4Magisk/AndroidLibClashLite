@@ -6,6 +6,7 @@
 package autoswitch
 
 import (
+	"cmp"
 	"context"
 	"slices"
 	"sync"
@@ -422,7 +423,8 @@ func (c *checker) checkGroup(ctx context.Context, name string) {
 
 // findReplacement tests preferred members first and other members only when no
 // preferred member is healthy. Within a tier, the first result below expected-delay
-// wins; otherwise all members are tested and the lowest delay wins.
+// wins, trying the fastest members of earlier scans first; otherwise all members
+// are tested and the lowest delay wins.
 func (c *checker) findReplacement(ctx context.Context, group string, selector *outboundgroup.Selector,
 	selected string) (string, uint16, Event) {
 	var preferred, others []C.Proxy
@@ -462,31 +464,40 @@ func (c *checker) findReplacement(ctx context.Context, group string, selector *o
 	return "", 0, summary
 }
 
+// testAll returns as soon as a member answers below expected-delay. Queued
+// members are then never probed, while probes already in flight finish in the
+// background instead of being cancelled: URLTest would record a cancelled probe
+// as a timeout in the node's delay history, and they end within the timeout.
 func (c *checker) testAll(ctx context.Context, proxies []C.Proxy) (string, uint16, int, int) {
-	// Cancelling this scan must not cancel the checker or the next group's scan.
-	scanCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	if c.settings.ExpectedDelay > 0 {
+		proxies = c.byLastDelay(proxies)
+	}
 	var (
 		mu        sync.Mutex
 		best      string
 		bestDelay uint16
 		tested    int
 		available int
+		accepted  bool
 		wg        sync.WaitGroup
 	)
+	stop := make(chan struct{})
 	jobs := make(chan C.Proxy)
 	for range min(c.settings.Concurrency, len(proxies)) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for proxy := range jobs {
-				if scanCtx.Err() != nil {
+				mu.Lock()
+				done := accepted
+				mu.Unlock()
+				if done || ctx.Err() != nil {
 					return
 				}
-				delay, ok := c.test(scanCtx, proxy)
+				delay, ok := c.test(ctx, proxy)
 				mu.Lock()
-				// Cancelled probes do not count as failures or replace the winner.
-				if scanCtx.Err() == nil {
+				// Late and cancelled probes do not count as failures or replace the winner.
+				if !accepted && ctx.Err() == nil {
 					tested++
 					c.engine.advanceProgress()
 					if ok {
@@ -495,7 +506,8 @@ func (c *checker) testAll(ctx context.Context, proxies []C.Proxy) (string, uint1
 							best, bestDelay = proxy.Name(), delay
 						}
 						if c.settings.ExpectedDelay > 0 && int(delay) < c.settings.ExpectedDelay {
-							cancel()
+							accepted = true
+							close(stop)
 						}
 					}
 				}
@@ -506,14 +518,47 @@ func (c *checker) testAll(ctx context.Context, proxies []C.Proxy) (string, uint1
 dispatch:
 	for _, proxy := range proxies {
 		select {
-		case <-scanCtx.Done():
+		case <-ctx.Done():
+			break dispatch
+		case <-stop:
 			break dispatch
 		case jobs <- proxy:
 		}
 	}
 	close(jobs)
-	wg.Wait()
+	finished := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(finished)
+	}()
+	select {
+	case <-finished:
+	case <-stop:
+	}
+	mu.Lock()
+	defer mu.Unlock()
 	return best, bestDelay, tested, available
+}
+
+// byLastDelay probes the members that answered fastest last time first, so an
+// expected-delay scan usually ends after one probe instead of waiting on dead
+// nodes. Untested and failed members (0xffff) keep their group order at the end.
+func (c *checker) byLastDelay(proxies []C.Proxy) []C.Proxy {
+	type candidate struct {
+		proxy C.Proxy
+		delay uint16
+	}
+	// Snapshot once: background probes may update the history during the sort.
+	candidates := make([]candidate, len(proxies))
+	for i, proxy := range proxies {
+		candidates[i] = candidate{proxy, proxy.LastDelayForTestUrl(c.settings.URL)}
+	}
+	slices.SortStableFunc(candidates, func(a, b candidate) int { return cmp.Compare(a.delay, b.delay) })
+	sorted := make([]C.Proxy, len(candidates))
+	for i, candidate := range candidates {
+		sorted[i] = candidate.proxy
+	}
+	return sorted
 }
 
 func (c *checker) test(ctx context.Context, proxy C.Proxy) (uint16, bool) {

@@ -3,6 +3,7 @@ package autoswitch
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,10 +19,13 @@ import (
 type probeProxy struct {
 	C.Proxy
 	name  string
+	last  uint16 // LastDelayForTestUrl; zero keeps the group order
 	probe func(context.Context) (uint16, error)
 }
 
 func (p *probeProxy) Name() string { return p.name }
+
+func (p *probeProxy) LastDelayForTestUrl(string) uint16 { return p.last }
 
 func (p *probeProxy) URLTest(ctx context.Context, _ string, _ utils.IntRanges[uint16]) (uint16, error) {
 	return p.probe(ctx)
@@ -88,16 +92,47 @@ func TestExpectedDelayIgnoresFailedProbe(t *testing.T) {
 	}
 }
 
-func TestExpectedDelayCancelsInFlightAndQueuedProbes(t *testing.T) {
+func TestExpectedDelayProbesLastFastestFirst(t *testing.T) {
+	var order []string
+	probe := func(name string, delay uint16) func(context.Context) (uint16, error) {
+		return func(context.Context) (uint16, error) {
+			order = append(order, name)
+			return delay, nil
+		}
+	}
+	proxies := []C.Proxy{
+		&probeProxy{name: "untested", last: 0xffff, probe: probe("untested", 50)},
+		&probeProxy{name: "slower", last: 200, probe: probe("slower", 60)},
+		&probeProxy{name: "fastest", last: 80, probe: probe("fastest", 70)},
+	}
+	best, _, tested, _ := newTestChecker(100, 1).testAll(context.Background(), proxies)
+	if best != "fastest" || tested != 1 || !slices.Equal(order, []string{"fastest"}) {
+		t.Fatalf("best=%s, tested=%d, order=%v", best, tested, order)
+	}
+	// Without expected-delay every member is probed anyway, in group order.
+	order = nil
+	if best, _, _, _ = newTestChecker(0, 1).testAll(context.Background(), proxies); best != "untested" ||
+		!slices.Equal(order, []string{"untested", "slower", "fastest"}) {
+		t.Fatalf("best=%s, order=%v", best, order)
+	}
+}
+
+func TestExpectedDelaySkipsQueuedAndKeepsInFlightProbes(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	started := make(chan struct{})
+	started, release, slowDone := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	var cancelled, queued atomic.Bool
 	proxies := []C.Proxy{
 		&probeProxy{name: "slow", probe: func(ctx context.Context) (uint16, error) {
+			defer close(slowDone)
 			close(started)
-			<-ctx.Done()
-			cancelled.Store(true)
+			// The scan returns while this probe is still running.
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+			// A cancelled probe would be recorded as a timeout in the node's history.
+			cancelled.Store(ctx.Err() != nil)
 			// Even a late success must not overwrite the accepted winner.
 			return 1, nil
 		}},
@@ -116,11 +151,13 @@ func TestExpectedDelayCancelsInFlightAndQueuedProbes(t *testing.T) {
 	}
 	c := newTestChecker(100, 2)
 	best, delay, tested, available := c.testAll(ctx, proxies)
-	if ctx.Err() != nil || !cancelled.Load() || queued.Load() {
-		t.Fatalf("parent=%v, cancelled=%v, queued=%v", ctx.Err(), cancelled.Load(), queued.Load())
-	}
 	if best != "winner" || delay != 90 || tested != 1 || available != 1 {
 		t.Fatalf("scan = %s/%d/%d/%d", best, delay, tested, available)
+	}
+	close(release)
+	<-slowDone
+	if ctx.Err() != nil || cancelled.Load() || queued.Load() {
+		t.Fatalf("parent=%v, cancelled=%v, queued=%v", ctx.Err(), cancelled.Load(), queued.Load())
 	}
 	// The next group/round uses the same parent, which must still be usable.
 	best, _, tested, _ = c.testAll(ctx, []C.Proxy{&probeProxy{name: "next",
