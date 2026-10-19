@@ -9,7 +9,6 @@ import (
 	"context"
 	"slices"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"cfa/native/autoswitch/option"
@@ -422,7 +421,8 @@ func (c *checker) checkGroup(ctx context.Context, name string) {
 }
 
 // findReplacement tests preferred members first and other members only when no
-// preferred member is healthy. The lowest delay wins within a tier.
+// preferred member is healthy. Within a tier, the first result below expected-delay
+// wins; otherwise all members are tested and the lowest delay wins.
 func (c *checker) findReplacement(ctx context.Context, group string, selector *outboundgroup.Selector,
 	selected string) (string, uint16, Event) {
 	var preferred, others []C.Proxy
@@ -448,11 +448,11 @@ func (c *checker) findReplacement(ctx context.Context, group string, selector *o
 			continue
 		}
 		c.engine.setProgress(Progress{Group: group, Stage: tier.stage, Total: len(tier.proxies)})
-		best, delay, available := c.testAll(ctx, tier.proxies)
+		best, delay, tested, available := c.testAll(ctx, tier.proxies)
 		if ctx.Err() != nil {
 			return "", 0, summary
 		}
-		summary.Tested += len(tier.proxies)
+		summary.Tested += tested
 		summary.Available += available
 		summary.Preferred = tier.stage == StagePreferred
 		if best != "" {
@@ -462,42 +462,58 @@ func (c *checker) findReplacement(ctx context.Context, group string, selector *o
 	return "", 0, summary
 }
 
-func (c *checker) testAll(ctx context.Context, proxies []C.Proxy) (string, uint16, int) {
+func (c *checker) testAll(ctx context.Context, proxies []C.Proxy) (string, uint16, int, int) {
+	// Cancelling this scan must not cancel the checker or the next group's scan.
+	scanCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	var (
 		mu        sync.Mutex
 		best      string
 		bestDelay uint16
-		available atomic.Int32
+		tested    int
+		available int
 		wg        sync.WaitGroup
 	)
-	slots := make(chan struct{}, c.settings.Concurrency)
-	for _, proxy := range proxies {
-		select {
-		case <-ctx.Done():
-		case slots <- struct{}{}:
-		}
-		if ctx.Err() != nil {
-			break
-		}
+	jobs := make(chan C.Proxy)
+	for range min(c.settings.Concurrency, len(proxies)) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			defer func() { <-slots }()
-			delay, ok := c.test(ctx, proxy)
-			c.engine.advanceProgress()
-			if !ok {
-				return
+			for proxy := range jobs {
+				if scanCtx.Err() != nil {
+					return
+				}
+				delay, ok := c.test(scanCtx, proxy)
+				mu.Lock()
+				// Cancelled probes do not count as failures or replace the winner.
+				if scanCtx.Err() == nil {
+					tested++
+					c.engine.advanceProgress()
+					if ok {
+						available++
+						if best == "" || delay < bestDelay {
+							best, bestDelay = proxy.Name(), delay
+						}
+						if c.settings.ExpectedDelay > 0 && int(delay) < c.settings.ExpectedDelay {
+							cancel()
+						}
+					}
+				}
+				mu.Unlock()
 			}
-			available.Add(1)
-			mu.Lock()
-			if best == "" || delay < bestDelay {
-				best, bestDelay = proxy.Name(), delay
-			}
-			mu.Unlock()
 		}()
 	}
+dispatch:
+	for _, proxy := range proxies {
+		select {
+		case <-scanCtx.Done():
+			break dispatch
+		case jobs <- proxy:
+		}
+	}
+	close(jobs)
 	wg.Wait()
-	return best, bestDelay, int(available.Load())
+	return best, bestDelay, tested, available
 }
 
 func (c *checker) test(ctx context.Context, proxy C.Proxy) (uint16, bool) {

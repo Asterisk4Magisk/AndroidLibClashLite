@@ -72,7 +72,7 @@ func runUntilEvent(t *testing.T, server *httptest.Server, filter string, kind Ev
 	// History survives checker restarts; only events newer than this point belong to the test.
 	previous := len(Snapshot().Events)
 	Apply(option.Settings{Enable: true, Groups: []string{"G"}, PreferredFilter: filter,
-		FailureThreshold: 1, URL: server.URL, Timeout: 1000})
+		URL: server.URL, Timeout: 1000})
 	t.Cleanup(func() { Apply(option.Settings{}) })
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -138,15 +138,15 @@ func TestPatchOverridesConfigurationUntilCleared(t *testing.T) {
 	if err := Patch(option.Settings{Enable: true}); err == nil {
 		t.Fatal("Patch accepted an enabled value without groups")
 	}
-	if err := Patch(option.Settings{Interval: 60}); err != nil {
+	if err := Patch(option.Settings{Interval: 60, ExpectedDelay: 150}); err != nil {
 		t.Fatal(err)
 	}
 	Apply(option.Settings{Interval: 20})
-	if state := Snapshot(); state.Source != SourceControl || state.Settings.Interval != 60 {
+	if state := Snapshot(); state.Source != SourceControl || state.Settings.Interval != 60 || state.Settings.ExpectedDelay != 150 {
 		t.Fatalf("after reload: %+v", state)
 	}
 	ClearOverride()
-	if state := Snapshot(); state.Source != SourceConfig || state.Settings.Interval != 20 {
+	if state := Snapshot(); state.Source != SourceConfig || state.Settings.Interval != 20 || state.Settings.ExpectedDelay != 0 {
 		t.Fatalf("after clear: %+v", state)
 	}
 }

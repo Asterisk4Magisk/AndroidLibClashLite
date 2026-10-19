@@ -1,6 +1,7 @@
 package option
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
 )
@@ -29,11 +30,38 @@ func TestValidate(t *testing.T) {
 		"enabled without groups":  {Settings{Enable: true, Groups: []string{" "}}, false},
 		"invalid filter":          {Settings{PreferredFilter: "("}, false},
 		"invalid expected status": {Settings{ExpectedStatus: "abc"}, false},
+		"negative expected delay": {Settings{ExpectedDelay: -1}, false},
+		"large expected delay":    {Settings{ExpectedDelay: 100000}, false},
+		"zero expected delay":     {Settings{ExpectedDelay: 0}, true},
+		"maximum expected delay":  {Settings{ExpectedDelay: 99999}, true},
 		"enabled with lookbehind": {Settings{Enable: true, Groups: []string{"G"}, PreferredFilter: `(?i)(?<![A-Za-z])UK(?![A-Za-z])`}, true},
 	} {
 		if err := test.settings.Validate(); (err == nil) != test.valid {
 			t.Errorf("%s: Validate() = %v", name, err)
 		}
+	}
+}
+
+func TestExpectedDelayAndFailureDefaults(t *testing.T) {
+	if got := (Settings{}).Normalized(); got.FailureThreshold != 1 || got.ExpectedDelay != 0 {
+		t.Fatalf("defaults = %+v", got)
+	}
+	for _, test := range []struct{ input, want int }{{-1, 0}, {0, 0}, {100, 100}, {99999, 99999}, {100000, 99999}} {
+		if got := (Settings{ExpectedDelay: test.input}).Normalized().ExpectedDelay; got != test.want {
+			t.Errorf("Normalized expected-delay %d = %d, want %d", test.input, got, test.want)
+		}
+	}
+	var settings Settings
+	if err := json.Unmarshal([]byte(`{"expected-delay":120}`), &settings); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(data, &fields); err != nil || fields["expected-delay"] != float64(120) {
+		t.Fatalf("JSON round trip = %s, error = %v", data, err)
 	}
 }
 

@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	DefaultFailureThreshold = 3
+	DefaultFailureThreshold = 1
 	DefaultIntervalSeconds  = 30
 	DefaultTimeoutMillis    = 5000
 	DefaultConcurrency      = 5
@@ -26,6 +26,7 @@ type Settings struct {
 	Groups           []string `yaml:"groups" json:"groups"`
 	PreferredFilter  string   `yaml:"preferred-filter" json:"preferred-filter"`
 	FailureThreshold int      `yaml:"failure-threshold" json:"failure-threshold"`
+	ExpectedDelay    int      `yaml:"expected-delay" json:"expected-delay"`
 	Interval         int      `yaml:"interval" json:"interval"`
 	URL              string   `yaml:"url" json:"url"`
 	Timeout          int      `yaml:"timeout" json:"timeout"`
@@ -48,6 +49,7 @@ func (s Settings) Normalized() Settings {
 	}
 	s.Groups = groups
 	s.FailureThreshold = clamp(s.FailureThreshold, DefaultFailureThreshold, 1, 10)
+	s.ExpectedDelay = min(max(s.ExpectedDelay, 0), 99999)
 	s.Interval = clamp(s.Interval, DefaultIntervalSeconds, 10, 3600)
 	s.Timeout = clamp(s.Timeout, DefaultTimeoutMillis, 1000, 30000)
 	s.Concurrency = clamp(s.Concurrency, DefaultConcurrency, 1, 32)
@@ -59,6 +61,9 @@ func (s Settings) Normalized() Settings {
 
 // Validate rejects values that Normalized would otherwise silently disable.
 func (s Settings) Validate() error {
+	if s.ExpectedDelay < 0 || s.ExpectedDelay > 99999 {
+		return errors.New("expected-delay must be between 0 and 99999 ms")
+	}
 	if _, err := s.CompileFilter(); err != nil {
 		return err
 	}
