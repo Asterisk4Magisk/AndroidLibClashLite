@@ -70,3 +70,27 @@ func TestHelperDoesNotFollowSymlink(t *testing.T) {
 		t.Fatal("helper update changed the symlink target")
 	}
 }
+
+func TestHelperRemovesStaleTemporaries(t *testing.T) {
+	home := t.TempDir()
+	stale := filepath.Join(home, ".system-dns-helper-stale.dex")
+	fresh := filepath.Join(home, ".system-dns-helper-fresh.dex")
+	for _, name := range []string{stale, fresh} {
+		if err := os.WriteFile(name, []byte("partial"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldTime := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(stale, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ensureHelper(home, []byte("embedded dex")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(stale); !os.IsNotExist(err) {
+		t.Fatal("stale temporary helper was not removed")
+	}
+	if _, err := os.Lstat(fresh); err != nil {
+		t.Fatal("recent temporary helper was removed")
+	}
+}

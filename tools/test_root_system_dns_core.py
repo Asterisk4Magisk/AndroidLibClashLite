@@ -1,6 +1,8 @@
 """Exercise the real standalone core and its embedded helper on a rootable AVD.
 
 Requires an x86_64 AAR, its javac/D8 helper dex from build staging, and adb.
+Build with --work-dir to retain the dex at
+<work-dir>/androidlibclash-staging/system-dns-dex/classes.dex.
 Owns only /data/local/tmp/libclash-system-dns-test and an optional dedicated home.
 Temporarily toggles Wi-Fi/data and restores their original settings.
 """
@@ -26,6 +28,8 @@ def main():
     parser.add_argument('--dex', required=True, type=pathlib.Path)
     parser.add_argument('--home', help='Dedicated test directory, including under app filesDir')
     parser.add_argument('--force-stop-app', help='Also verify independence from this installed app')
+    parser.add_argument('--restart-system-server', action='store_true',
+                        help='Also kill system_server (restarts the Android framework)')
     args = parser.parse_args()
     adb = ['adb', '-s', args.serial]
     remote = '/data/local/tmp/libclash-system-dns-test'
@@ -115,6 +119,10 @@ rules: ["MATCH,DIRECT"]
             call('forward', 'tcp:' + port, 'tcp:' + port)
         logs = open(temp / 'core.log', 'w+')
 
+        def log_text():
+            logs.flush()
+            return (temp / 'core.log').read_text(errors='replace')
+
         def start():
             nonlocal process, owner, observer
             shell('rm', '-f', remote + '/core.pid')
@@ -188,24 +196,41 @@ rules: ["MATCH,DIRECT"]
             start()
             assert shell('stat', '-c', '%i %Y', helper_file) != identity
             print('PASS same-size stale dex replaced before ART loads it', flush=True)
+            shutdowns = log_text().count('Mihomo shutting down')
             shell('kill', '-KILL', str(observer))
-            assert process.wait(timeout=10) == 70
+            assert process.wait(timeout=15) == 70
             until(lambda: not alive(observer))
-            print('PASS helper failure exits core with status 70', flush=True)
+            assert log_text().count('Mihomo shutting down') == shutdowns + 1
+            print('PASS helper failure shuts core down gracefully with status 70', flush=True)
             start()
             shell('kill', '-STOP', str(observer))
             shell('kill', '-KILL', str(owner))
             assert process.wait(timeout=10) == 137
             until(lambda: not alive(observer))
             print('PASS core SIGKILL also kills stopped helper via pinned-thread PDEATHSIG', flush=True)
+            if args.restart_system_server:
+                start()
+                server = shell('pidof', 'system_server')
+                shell('kill', '-KILL', server)
+                assert process.wait(timeout=60) == 70
+                until(lambda: not alive(observer))
+                assert 'Connectivity service died' in log_text()
+                # svc needs the restarted framework's Wi-Fi service before cleanup.
+                until(lambda: shell('pidof', 'system_server', check=False) not in ('', server) and
+                      shell('getprop', 'sys.boot_completed', check=False) == '1' and
+                      'not found' not in shell('service', 'check', 'wifi', check=False), timeout=180)
+                print('PASS system_server restart exits core instead of keeping stale DNS', flush=True)
         except BaseException:
             logs.flush()
             logs.seek(0)
             print(logs.read())
             raise
         finally:
+            # A freshly restarted framework may reject svc briefly.
             for kind, enabled in initial.items():
-                shell('svc', kind, 'enable' if enabled else 'disable')
+                command = shlex.join(['svc', kind, 'enable' if enabled else 'disable'])
+                until(lambda: subprocess.run(adb + ['shell', command], capture_output=True,
+                                             timeout=40).returncode == 0, timeout=60)
             if process is not None and process.poll() is None:
                 stop()
             logs.close()

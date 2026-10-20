@@ -2,8 +2,11 @@ package environment
 
 import "os"
 
+// The DNS hot path consults this; a core never changes its effective UID.
+var managedSystemDNS = IsCLI && os.Geteuid() == 0
+
 // Only standalone ROOT owns a Java observer. JNI keeps the app's callbacks;
 // non-root standalone invocations retain the native resolver implementation.
 func ManagedSystemDNS() bool {
-	return IsCLI && os.Geteuid() == 0
+	return managedSystemDNS
 }

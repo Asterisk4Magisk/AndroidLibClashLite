@@ -12,6 +12,7 @@ import android.net.NetworkRequest;
 import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.os.IBinder;
 import android.os.Looper;
 import android.os.ParcelFileDescriptor;
 import android.os.Process;
@@ -81,8 +82,9 @@ public final class SystemDnsHelper {
         }
     }
 
-    // app_process has no app Context. This intentional root-only bootstrap is
-    // the sole hidden-API boundary; public SDK calls handle Connectivity Binder.
+    // app_process has no app Context. This intentional root-only bootstrap and
+    // the death link below are the only hidden-API boundaries; public SDK calls
+    // handle Connectivity Binder.
     @SuppressLint("PrivateApi")
     private static Context systemContext() throws ReflectiveOperationException {
         Class<?> activityThread = Class.forName("android.app.ActivityThread");
@@ -90,7 +92,22 @@ public final class SystemDnsHelper {
         return (Context) activityThread.getMethod("getSystemContext").invoke(thread);
     }
 
+    // Callbacks live in system_server. After it restarts this process would keep
+    // running without them and the core would retain stale DNS, so treat the
+    // service's death like any other helper failure.
+    @SuppressLint("PrivateApi")
+    private static void exitWithConnectivityService() throws Exception {
+        IBinder service = (IBinder) Class.forName("android.os.ServiceManager")
+                .getMethod("getService", String.class).invoke(null, Context.CONNECTIVITY_SERVICE);
+        if (service == null) throw new IllegalStateException("Connectivity service unavailable");
+        service.linkToDeath(() -> {
+            System.err.println("Connectivity service died; system DNS helper exiting");
+            System.exit(1);
+        }, 0);
+    }
+
     private void run(OutputStream output) throws Exception {
+        exitWithConnectivityService();
         worker.start();
         Handler handler = new Handler(worker.getLooper());
         ConnectivityManager.NetworkCallback callback = new ConnectivityManager.NetworkCallback() {

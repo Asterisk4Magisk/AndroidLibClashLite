@@ -9,11 +9,27 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
 
-const helperFilename = "system-dns-helper.dex"
+const (
+	helperFilename = "system-dns-helper.dex"
+	tempPattern    = ".system-dns-helper-*.dex"
+)
+
+// A core killed while replacing the dex leaves its temporary behind. Skip
+// recent files in case another process is still writing one.
+func removeStaleTemporaries(home string) {
+	names, _ := filepath.Glob(filepath.Join(home, tempPattern))
+	for _, name := range names {
+		if info, err := os.Lstat(name); err == nil && info.Mode().IsRegular() &&
+			time.Since(info.ModTime()) > time.Minute {
+			_ = os.Remove(name)
+		}
+	}
+}
 
 // Retain the real path and ART's sibling oat cache across process exits.
 // Android 8's class loader cannot open an already unlinked dex through procfs.
@@ -30,7 +46,8 @@ func ensureHelper(home string, payload []byte) (string, error) {
 	if err != nil || match {
 		return path, err
 	}
-	file, err := os.CreateTemp(home, ".system-dns-helper-*.dex")
+	removeStaleTemporaries(home)
+	file, err := os.CreateTemp(home, tempPattern)
 	if err != nil {
 		return "", err
 	}

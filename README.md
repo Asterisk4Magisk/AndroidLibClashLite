@@ -223,10 +223,11 @@ cache. No APK path or Gradle build is needed for the helper.
 
 An anonymous socketpair carries version 1 address snapshots directly to the
 core. Go's stdio/ExtraFiles mapping passes the child endpoint as fd 0 and fd 3;
-no named DNS socket is created. Helper failure clears DNS and exits the core
-with status 70. JNI continues to use `notifyDnsChanged` from its host app.
+no named DNS socket is created. Helper failure, including loss of the
+connectivity service when system_server restarts, clears DNS and shuts the core
+down gracefully with status 70. JNI continues to use `notifyDnsChanged` from its
+host app.
 
-See [implementation and validation](docs/root-system-dns.md).
 Build with `scripts/build_shared.py`; local AsteriskMETA builds can consume the
 AAR via `-PandroidLibClashLiteAar=/path/libclash.aar`. Host tests:
 `go test ./native/systemdns`.

@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -24,6 +25,16 @@ import (
 //
 //go:embed helper.dex
 var helperDex []byte
+
+var channelFailed atomic.Bool
+
+// ExitCode reports the status for a core that shut down after losing its helper.
+func ExitCode() int {
+	if channelFailed.Load() {
+		return 70
+	}
+	return 0
+}
 
 // Start is called only for a running CLI service, never JNI or CLI tool commands.
 func Start(home string) (func(), error) {
@@ -53,7 +64,7 @@ func Start(home string) (func(), error) {
 	// Only ExtraFiles/stdio duplicates survive exec; parent fds stay CLOEXEC.
 	cmd.Stdin = child
 	cmd.ExtraFiles = []*os.File{child}
-	cmd.Stdout = os.Stderr
+	// stdout only carries the standalone smoke test's readiness line.
 	cmd.Stderr = os.Stderr
 	// Keep helper signals separate from the core's graceful group shutdown.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL}
@@ -118,7 +129,12 @@ func Start(home string) (func(), error) {
 				dns.UpdateSystemDNS(nil)
 				dns.FlushCacheWithDefaultResolver()
 				_, _ = fmt.Fprintf(os.Stderr, "system DNS channel failed: %v\n", err)
-				os.Exit(70)
+				// Shut down like an external SIGTERM so listeners remove their
+				// routes and redirect rules; force the status if that stalls.
+				channelFailed.Store(true)
+				_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
+				time.AfterFunc(10*time.Second, func() { os.Exit(70) })
+				return
 			}
 			if !reflect.DeepEqual(previous, next) {
 				previous = next

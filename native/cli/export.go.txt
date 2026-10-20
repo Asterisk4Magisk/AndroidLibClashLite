@@ -30,7 +30,7 @@ func AndroidMihomoCLI_v1(argc C.int, argv **C.char, stdoutFD, stderrFD C.int) C.
 	}
 	initMihomoCLI()
 	mihomoCLIMain()
-	return 0
+	return C.int(systemdns.ExitCode())
 }
 
 // Called by the CLI overlay after tool commands and home-directory selection.
