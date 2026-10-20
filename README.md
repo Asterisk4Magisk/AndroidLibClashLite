@@ -6,8 +6,8 @@ share one Go runtime and Core. The stable core version is pinned in `go.mod`.
 ## Build
 
 Requirements: Go (version from `go.mod`), JDK 21+, Python 3.10+, Android SDK
-platform 37 and NDK 28.2.13676358. Set `ANDROID_HOME`, `ANDROID_NDK_HOME` and
-`JAVA_HOME`. No Gradle or separate Kotlin compiler is required.
+platform 37.0, Build Tools 37.0.0 and NDK 28.2.13676358. Set `ANDROID_HOME`,
+`ANDROID_NDK_HOME` and `JAVA_HOME`. No Gradle or separate Kotlin compiler is required.
 
 ```sh
 python scripts/build_shared.py
@@ -206,3 +206,27 @@ updating. CI builds do not substitute for Android device regression testing.
 ## License
 
 Original contributions in this repository are licensed under [LGPL-3.0](LICENSE). Upstream and third-party code retain their respective licenses.
+
+## ROOT system DNS integration
+
+A running standalone CLI with effective UID 0 starts its own Java network
+observer; JNI and CLI tool commands (`-v`, `-h`, `-t`) do not. The observer uses
+ConnectivityManager / LinkProperties to supply physical-network DNS addresses.
+Mihomo performs the DNS exchanges for `system`, including `direct-nameserver`
+and `nameserver-policy`. The app and asteriskd do not relay DNS snapshots.
+
+The build compiles `native/systemdns/java` with javac and SDK D8, then embeds
+the single dex in `libgojni.so`. At startup the core verifies and reuses
+`<core-home>/system-dns-helper.dex`, or atomically replaces it from the embedded
+bytes. The file is root-owned, mode 0400, and retained at exit with any ART
+cache. No APK path or Gradle build is needed for the helper.
+
+An anonymous socketpair carries version 1 address snapshots directly to the
+core. Go's stdio/ExtraFiles mapping passes the child endpoint as fd 0 and fd 3;
+no named DNS socket is created. Helper failure clears DNS and exits the core
+with status 70. JNI continues to use `notifyDnsChanged` from its host app.
+
+See [implementation and validation](docs/root-system-dns.md).
+Build with `scripts/build_shared.py`; local AsteriskMETA builds can consume the
+AAR via `-PandroidLibClashLiteAar=/path/libclash.aar`. Host tests:
+`go test ./native/systemdns`.

@@ -80,6 +80,31 @@ def package_aar(baseline, target, artifacts):
             package.writestr(entry, path.read_bytes())
 
 
+def build_system_dns_helper(repo, stage, source, env):
+    sdk = pathlib.Path(env['ANDROID_HOME']).resolve()
+    android_jar = sdk / 'platforms/android-37.0/android.jar'
+    d8 = sdk / 'build-tools/37.0.0/lib/d8.jar'
+    for required in (android_jar, d8):
+        if not required.is_file():
+            raise ValueError(f'Android SDK component missing: {required}')
+    suffix = '.exe' if os.name == 'nt' else ''
+    java_home = env.get('JAVA_HOME')
+    def java_tool(name):
+        return pathlib.Path(java_home) / 'bin' / (name + suffix) if java_home else name + suffix
+    classes = stage / 'system-dns-classes'
+    dex = stage / 'system-dns-dex'
+    classes.mkdir()
+    dex.mkdir()
+    run([java_tool('javac'), '--release', '8', '-classpath', android_jar,
+         '-d', classes, *sorted((repo / 'native/systemdns/java').rglob('*.java'))], repo, env)
+    run([java_tool('java'), '-cp', d8, 'com.android.tools.r8.D8', '--release',
+         '--min-api', '26', '--lib', android_jar, '--output', dex,
+         *sorted(classes.rglob('*.class'))], repo, env)
+    if sorted(path.name for path in dex.iterdir()) != ['classes.dex']:
+        raise ValueError('System DNS helper must fit in one dex')
+    shutil.copyfile(dex / 'classes.dex', source / 'native/systemdns/helper.dex')
+
+
 def build(args, work):
     repo = pathlib.Path(__file__).resolve().parents[1]
     env = os.environ.copy()
@@ -101,6 +126,7 @@ def build(args, work):
     writable_directories(core)
     version = module['Version']
     source, overlay = prepare_sources(repo, stage, core)
+    build_system_dns_helper(repo, stage, source, env)
     run(['go', 'mod', 'edit', '-replace=github.com/metacubex/mihomo=../mihomo'], source, env)
     epoch = int(env.get('SOURCE_DATE_EPOCH', datetime.datetime.now(datetime.timezone.utc).timestamp()))
     date = datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc)

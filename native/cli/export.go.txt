@@ -11,6 +11,7 @@ import (
 
 	_ "cfa/environment"
 	_ "cfa/native/autoswitch/api"
+	"cfa/native/systemdns"
 )
 
 // AndroidMihomoCLI_v1 is only for a standalone process, never a JNI caller.
@@ -30,4 +31,14 @@ func AndroidMihomoCLI_v1(argc C.int, argv **C.char, stdoutFD, stderrFD C.int) C.
 	initMihomoCLI()
 	mihomoCLIMain()
 	return 0
+}
+
+// Called by the CLI overlay after tool commands and home-directory selection.
+func startSystemDNS(home string) func() {
+	stop, err := systemdns.Start(home)
+	if err != nil {
+		_, _ = os.Stderr.WriteString(err.Error() + "\n")
+		os.Exit(70)
+	}
+	return stop
 }

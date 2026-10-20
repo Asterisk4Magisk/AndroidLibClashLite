@@ -23,6 +23,11 @@ def prepare_sources(repo, work, core):
     main = (core / 'main.go').read_text(encoding='utf-8')
     main = replace_once(main, 'func init() {', 'func initMihomoCLI() {')
     main = replace_once(main, 'func main() {', 'func mihomoCLIMain() {')
+    main = replace_once(main, '\tif geodataMode {',
+                        '\tif !testConfig {\n'
+                        '\t\tstopSystemDNS := startSystemDNS(C.Path.HomeDir())\n'
+                        '\t\tdefer stopSystemDNS()\n'
+                        '\t}\n\n\tif geodataMode {')
     cli = work / 'cli'
     cli.mkdir(exist_ok=True)
     (cli / 'mihomo_cli.go').write_text(main, encoding='utf-8')
@@ -65,7 +70,7 @@ def prepare_sources(repo, work, core):
     patch('dns/system_common.go', 'func (c *systemClient) ResetConnection()',
           'func (c *systemClient) resetNativeConnection()')
     patch('dns/patch_android.go', 'package dns',
-          'package dns\n\nimport "github.com/metacubex/mihomo/constant/features"\nimport "sync/atomic"')
+          'package dns\n\nimport "cfa/environment"\nimport "github.com/metacubex/mihomo/constant/features"\nimport "sync/atomic"')
     # Android network notifications race DNS exchanges and connection resets.
     # Publish immutable slices so workers can retain a consistent snapshot.
     patch('dns/patch_android.go', 'var systemResolver []dnsClient',
@@ -83,10 +88,10 @@ def prepare_sources(repo, work, core):
           '\tfor _, r := range systemResolverSnapshot() {')
     patch('dns/patch_android.go', 'func (c *systemClient) getDnsClients() ([]dnsClient, error) {',
           'func (c *systemClient) getDnsClients() ([]dnsClient, error) {\n'
-          '\tif !features.CMFA { return c.getNativeDnsClients() }')
+          '\tif !features.CMFA && !environment.ManagedSystemDNS() { return c.getNativeDnsClients() }')
     patch('dns/patch_android.go', 'func (c *systemClient) ResetConnection() {',
           'func (c *systemClient) ResetConnection() {\n'
-          '\tif !features.CMFA { c.resetNativeConnection(); return }')
+          '\tif !features.CMFA && !environment.ManagedSystemDNS() { c.resetNativeConnection(); return }')
     # Carry the top-level asterisk-auto-switch key through both JNI and CLI
     # configuration applies, including hot profile reloads.
     patch('config/config.go', 'package config\n',

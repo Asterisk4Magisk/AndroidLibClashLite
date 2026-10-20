@@ -1,0 +1,87 @@
+//go:build android || linux
+
+package systemdns
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"syscall"
+
+	"golang.org/x/sys/unix"
+)
+
+const helperFilename = "system-dns-helper.dex"
+
+// Retain the real path and ART's sibling oat cache across process exits.
+// Android 8's class loader cannot open an already unlinked dex through procfs.
+func ensureHelper(home string, payload []byte) (string, error) {
+	home, err := filepath.Abs(home)
+	if err != nil {
+		return "", err
+	}
+	if err = os.MkdirAll(home, 0700); err != nil {
+		return "", err
+	}
+	path := filepath.Join(home, helperFilename)
+	match, err := helperMatches(path, payload)
+	if err != nil || match {
+		return path, err
+	}
+	file, err := os.CreateTemp(home, ".system-dns-helper-*.dex")
+	if err != nil {
+		return "", err
+	}
+	defer os.Remove(file.Name())
+	defer file.Close()
+	if _, err = file.Write(payload); err != nil {
+		return "", err
+	}
+	if err = file.Chmod(0400); err != nil {
+		return "", err
+	}
+	if err = file.Sync(); err != nil {
+		return "", err
+	}
+	if err = file.Close(); err != nil {
+		return "", err
+	}
+	if err = os.Rename(file.Name(), path); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func helperMatches(path string, payload []byte) (bool, error) {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	if err == unix.ENOENT || err == unix.ELOOP {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	file := os.NewFile(uintptr(fd), path)
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return false, err
+	}
+	if !info.Mode().IsRegular() {
+		return false, fmt.Errorf("system DNS helper is not a regular file")
+	}
+	if info.Sys().(*syscall.Stat_t).Uid != uint32(os.Geteuid()) || info.Size() != int64(len(payload)) {
+		return false, nil
+	}
+	content, err := io.ReadAll(io.LimitReader(file, int64(len(payload))+1))
+	if err != nil || !bytes.Equal(content, payload) {
+		return false, err
+	}
+	if info.Mode().Perm() != 0400 {
+		if err = file.Chmod(0400); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
+}
