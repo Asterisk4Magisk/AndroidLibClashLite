@@ -1,6 +1,6 @@
 module cfa
 
-go 1.27.1
+go 1.27
 
 require (
 	github.com/dlclark/regexp2 v1.12.0
@@ -8,7 +8,7 @@ require (
 	github.com/metacubex/http v0.1.8
 	github.com/metacubex/mihomo v1.19.33
 	go.uber.org/automaxprocs v1.6.0
-	golang.org/x/sync v0.23.0
+	golang.org/x/sync v0.24.0
 )
 
 require (

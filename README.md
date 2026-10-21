@@ -118,6 +118,31 @@ restores environment settings, including `XDG_CONFIG_HOME`, `SAFE_PATHS`,
 protection callbacks. Checked source overlays adapt the pinned upstream module;
 they fail when expected source patterns change.
 
+## ROOT system DNS integration
+
+A running standalone CLI with effective UID 0 starts its own Java network
+observer; JNI and CLI tool commands (`-v`, `-h`, `-t`) do not. The observer uses
+ConnectivityManager / LinkProperties to supply physical-network DNS addresses.
+Mihomo performs the DNS exchanges for `system`, including `direct-nameserver`
+and `nameserver-policy`. The app and asteriskd do not relay DNS snapshots.
+
+The build compiles `native/systemdns/java` with javac and SDK D8, then embeds
+the single dex in `libgojni.so`. At startup the core verifies and reuses
+`<core-home>/system-dns-helper.dex`, or atomically replaces it from the embedded
+bytes. The file is root-owned, mode 0400, and retained at exit with any ART
+cache. No APK path or Gradle build is needed for the helper.
+
+An anonymous socketpair carries version 1 address snapshots directly to the
+core. Go's stdio/ExtraFiles mapping passes the child endpoint as fd 0 and fd 3;
+no named DNS socket is created. Helper failure, including loss of the
+connectivity service when system_server restarts, clears DNS and shuts the core
+down gracefully with status 70. JNI continues to use `notifyDnsChanged` from its
+host app.
+
+Build with `scripts/build_shared.py`; local AsteriskMETA builds can consume the
+AAR via `-PandroidLibClashLiteAar=/path/libclash.aar`. Host tests:
+`go test ./native/systemdns`.
+
 ## Auto-switch
 
 The core can replace a failed node selected in a manual `select` group with a
@@ -206,28 +231,3 @@ updating. CI builds do not substitute for Android device regression testing.
 ## License
 
 Original contributions in this repository are licensed under [LGPL-3.0](LICENSE). Upstream and third-party code retain their respective licenses.
-
-## ROOT system DNS integration
-
-A running standalone CLI with effective UID 0 starts its own Java network
-observer; JNI and CLI tool commands (`-v`, `-h`, `-t`) do not. The observer uses
-ConnectivityManager / LinkProperties to supply physical-network DNS addresses.
-Mihomo performs the DNS exchanges for `system`, including `direct-nameserver`
-and `nameserver-policy`. The app and asteriskd do not relay DNS snapshots.
-
-The build compiles `native/systemdns/java` with javac and SDK D8, then embeds
-the single dex in `libgojni.so`. At startup the core verifies and reuses
-`<core-home>/system-dns-helper.dex`, or atomically replaces it from the embedded
-bytes. The file is root-owned, mode 0400, and retained at exit with any ART
-cache. No APK path or Gradle build is needed for the helper.
-
-An anonymous socketpair carries version 1 address snapshots directly to the
-core. Go's stdio/ExtraFiles mapping passes the child endpoint as fd 0 and fd 3;
-no named DNS socket is created. Helper failure, including loss of the
-connectivity service when system_server restarts, clears DNS and shuts the core
-down gracefully with status 70. JNI continues to use `notifyDnsChanged` from its
-host app.
-
-Build with `scripts/build_shared.py`; local AsteriskMETA builds can consume the
-AAR via `-PandroidLibClashLiteAar=/path/libclash.aar`. Host tests:
-`go test ./native/systemdns`.
