@@ -41,6 +41,8 @@ const (
 	EventSwitched         EventKind = "switched"
 	EventNoReplacement    EventKind = "no-replacement"
 	EventSelectionChanged EventKind = "selection-changed"
+	// EventRestored switches back from Node to the original selection Target.
+	EventRestored EventKind = "restored"
 )
 
 type GroupStatusKind string
@@ -75,8 +77,12 @@ type GroupStatus struct {
 	Delay    uint16          `json:"delay,omitempty"`
 	Failures int             `json:"failures,omitempty"`
 	// InUse marks a healthy result proven by live traffic instead of a probe.
-	InUse     bool  `json:"inUse,omitempty"`
-	CheckedAt int64 `json:"checkedAt"`
+	InUse bool `json:"inUse,omitempty"`
+	// Origin is the original selection awaiting restore after OriginSuccesses of
+	// option.RestoreSuccesses consecutive healthy checks.
+	Origin          string `json:"origin,omitempty"`
+	OriginSuccesses int    `json:"originSuccesses,omitempty"`
+	CheckedAt       int64  `json:"checkedAt"`
 }
 
 type ProgressStage string
@@ -85,6 +91,7 @@ const (
 	StageCurrent   ProgressStage = "current"
 	StagePreferred ProgressStage = "preferred"
 	StageAll       ProgressStage = "all"
+	StageRestore   ProgressStage = "restore"
 )
 
 type Progress struct {
@@ -129,6 +136,9 @@ type engine struct {
 	override   *option.Settings
 	cancel     context.CancelFunc
 	done       chan struct{}
+	// restores outlives checker restarts so a hot reload keeps the original
+	// selections. Only the running checker, or restartLocked while none runs, uses it.
+	restores map[string]restore
 
 	mu          sync.Mutex
 	active      option.Settings
@@ -234,8 +244,16 @@ func (e *engine) restartLocked() {
 	e.phase, e.nextCheckAt, e.progress = PhaseStopped, 0, nil
 	e.groups = make(map[string]GroupStatus)
 	e.mu.Unlock()
+	for name := range e.restores {
+		if !settings.Enable || !settings.Restore || !slices.Contains(settings.Groups, name) {
+			delete(e.restores, name)
+		}
+	}
 	if !settings.Enable || len(settings.Groups) == 0 {
 		return
+	}
+	if e.restores == nil {
+		e.restores = make(map[string]restore)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -271,6 +289,9 @@ func (e *engine) advanceProgress() {
 
 func (e *engine) setGroup(status GroupStatus) {
 	status.CheckedAt = time.Now().UnixMilli()
+	if r, ok := e.restores[status.Name]; ok {
+		status.Origin, status.OriginSuccesses = r.origin, r.successes
+	}
 	e.mu.Lock()
 	e.groups[status.Name] = status
 	e.mu.Unlock()
@@ -296,6 +317,14 @@ type failure struct {
 	skip    int
 }
 
+// restore remembers the selection made before automatic switching moved a group
+// to target, and how many consecutive checks origin has passed since.
+type restore struct {
+	origin    string
+	target    string
+	successes int
+}
+
 type checker struct {
 	engine   *engine
 	settings option.Settings
@@ -319,15 +348,25 @@ func (c *checker) run(ctx context.Context) {
 		case <-timer.C:
 		}
 		c.engine.setPhase(PhaseChecking, 0)
-		for _, group := range c.settings.Groups {
-			if ctx.Err() != nil {
-				return
-			}
-			c.checkGroup(ctx, group)
+		c.round(ctx)
+		if ctx.Err() != nil {
+			return
 		}
 		// A long round delays the next one instead of overlapping it.
 		c.engine.setPhase(PhaseWaiting, time.Now().Add(interval).UnixMilli())
 		timer.Reset(interval)
+	}
+}
+
+func (c *checker) round(ctx context.Context) {
+	for _, group := range c.settings.Groups {
+		if ctx.Err() != nil {
+			return
+		}
+		// A restored node has just passed its check; the group needs no second probe.
+		if !c.checkRestore(ctx, group) {
+			c.checkGroup(ctx, group)
+		}
 	}
 }
 
@@ -414,11 +453,80 @@ func (c *checker) checkGroup(ctx context.Context, name string) {
 	}
 	cachefile.Cache().SetSelected(name, replacement)
 	closeConnectionsThrough(name)
+	c.rememberOrigin(name, selected, replacement)
 	summary.Group, summary.Kind, summary.Node, summary.Target, summary.Delay =
 		name, EventSwitched, selected, replacement, replacementDelay
 	c.engine.record(summary)
 	c.engine.setGroup(GroupStatus{Name: name, Kind: GroupHealthy, Node: replacement, Delay: replacementDelay})
 	log.Infoln("[AutoSwitch] %s: %s -> %s (%d ms)", name, selected, replacement, replacementDelay)
+}
+
+// rememberOrigin keeps the first selection of a chain of automatic switches, so a
+// replacement that fails in turn still restores the node the user chose.
+func (c *checker) rememberOrigin(group, selected, replacement string) {
+	if !c.settings.Restore {
+		return
+	}
+	r, ok := c.engine.restores[group]
+	if !ok || r.target != selected {
+		r = restore{origin: selected}
+	}
+	if r.origin == replacement {
+		delete(c.engine.restores, group)
+		return
+	}
+	r.target, r.successes = replacement, 0
+	c.engine.restores[group] = r
+}
+
+// checkRestore probes the original selection of a group that automatic switching
+// moved, and selects it again after option.RestoreSuccesses consecutive healthy
+// checks. Any other change of the selection, such as a manual choice, abandons
+// the restore. It reports whether the group was switched back.
+func (c *checker) checkRestore(ctx context.Context, name string) bool {
+	r, ok := c.engine.restores[name]
+	if !ok {
+		return false
+	}
+	selector := lookupSelector(name)
+	if selector == nil || selector.Now() != r.target {
+		delete(c.engine.restores, name)
+		return false
+	}
+	proxy := member(selector, r.origin)
+	if proxy == nil || !isLeaf(proxy) {
+		delete(c.engine.restores, name)
+		return false
+	}
+	c.engine.setProgress(Progress{Group: name, Stage: StageRestore, Total: 1})
+	delay, ok := c.test(ctx, proxy)
+	if ctx.Err() != nil {
+		return false
+	}
+	if !ok {
+		r.successes = 0
+		c.engine.restores[name] = r
+		return false
+	}
+	r.successes++
+	if r.successes < option.RestoreSuccesses {
+		c.engine.restores[name] = r
+		return false
+	}
+
+	delete(c.engine.restores, name)
+	// Compare and set, as for a switch: a manual selection made meanwhile wins.
+	if selector.Now() != r.target || selector.Set(r.origin) != nil {
+		c.engine.record(Event{Group: name, Kind: EventSelectionChanged, Node: r.target, Target: r.origin})
+		return false
+	}
+	delete(c.failures, name)
+	cachefile.Cache().SetSelected(name, r.origin)
+	closeConnectionsThrough(name)
+	c.engine.record(Event{Group: name, Kind: EventRestored, Node: r.target, Target: r.origin, Delay: delay})
+	c.engine.setGroup(GroupStatus{Name: name, Kind: GroupHealthy, Node: r.origin, Delay: delay})
+	log.Infoln("[AutoSwitch] %s: restored %s -> %s (%d ms)", name, r.target, r.origin, delay)
+	return true
 }
 
 // findReplacement tests preferred members first and other members only when no

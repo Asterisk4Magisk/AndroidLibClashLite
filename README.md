@@ -158,6 +158,7 @@ asterisk-auto-switch:
   preferred-filter: "(?i)HK"   # regexp2, like a group filter; optional
   failure-threshold: 1         # 1-10 consecutive failures
   expected-delay: 0            # ms; stop a scan at the first delay below it, 0 tests all
+  restore: false               # switch back once the original node recovers
   interval: 30                 # 10-3600 seconds between rounds
   url: https://www.gstatic.com/generate_204
   timeout: 5000                # 1000-30000 ms per test
@@ -182,10 +183,18 @@ through the group. A scan that finds no healthy member is retried after 1, 2, 4
 and then at most 8 failing rounds, so an offline device does not probe every node
 each interval.
 
+With `restore`, the node selected before the first automatic switch is probed
+every round while the group still holds the automatic replacement (a further
+automatic switch keeps the original). After 3 consecutive healthy probes it is
+selected again, with the same compare-and-set, cache update and connection
+close as a switch. Any other selection change abandons the restore. Pending
+restores survive hot reloads while `restore` stays enabled, and the group
+status reports them as `origin` and `originSuccesses`.
+
 `GET /asterisk/auto-switch` (authenticated like other Clash API routes) returns
 the active settings, their source (`config` or `control`), phase, next check
 time, progress, per-group status and up to 100 newest-first events (`failed`,
-`switched`, `no-replacement`, `selection-changed`). Events stay in memory only.
+`switched`, `no-replacement`, `selection-changed`, `restored`). Events stay in memory only.
 `PATCH /asterisk/auto-switch` with the same JSON settings applies immediately.
 The value survives hot profile reloads (`PUT /configs` or JNI load) and lasts
 until the process exits or JNI `reset()`; the YAML value applies again only in a

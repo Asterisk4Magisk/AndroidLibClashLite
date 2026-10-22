@@ -17,6 +17,7 @@ const (
 	DefaultTimeoutMillis    = 5000
 	DefaultConcurrency      = 5
 	DefaultURL              = "https://www.gstatic.com/generate_204"
+	RestoreSuccesses        = 3
 )
 
 // Settings is read from the top-level `asterisk-auto-switch` key and accepted by
@@ -27,11 +28,14 @@ type Settings struct {
 	PreferredFilter  string   `yaml:"preferred-filter" json:"preferred-filter"`
 	FailureThreshold int      `yaml:"failure-threshold" json:"failure-threshold"`
 	ExpectedDelay    int      `yaml:"expected-delay" json:"expected-delay"`
-	Interval         int      `yaml:"interval" json:"interval"`
-	URL              string   `yaml:"url" json:"url"`
-	Timeout          int      `yaml:"timeout" json:"timeout"`
-	ExpectedStatus   string   `yaml:"expected-status" json:"expected-status"`
-	Concurrency      int      `yaml:"concurrency" json:"concurrency"`
+	// Restore switches back to the node chosen before the first automatic switch
+	// once it passes RestoreSuccesses consecutive health checks.
+	Restore        bool   `yaml:"restore" json:"restore"`
+	Interval       int    `yaml:"interval" json:"interval"`
+	URL            string `yaml:"url" json:"url"`
+	Timeout        int    `yaml:"timeout" json:"timeout"`
+	ExpectedStatus string `yaml:"expected-status" json:"expected-status"`
+	Concurrency    int    `yaml:"concurrency" json:"concurrency"`
 }
 
 // Normalized fills defaults and clamps ranges. It never fails; use Validate for
