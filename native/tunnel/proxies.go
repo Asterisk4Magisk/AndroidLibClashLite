@@ -57,8 +57,6 @@ func PatchSelector(selector, name string) bool {
 
 	log.Infoln("Patch selector %s -> %s", selector, name)
 
-	closeConnByGroup(selector)
-
 	return true
 }
 
