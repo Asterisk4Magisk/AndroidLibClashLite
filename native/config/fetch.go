@@ -3,7 +3,6 @@ package config
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	U "net/url"
@@ -283,11 +282,8 @@ func FetchAndValid(
 		return err
 	}
 
-	providerErrors := make([]error, 0)
-	payloadFetchErrors := make(map[string]error)
 	forEachProviders(rawCfg, func(index int, total int, name string, provider map[string]any, prefix string) {
 		if err := ctx.Err(); err != nil {
-			providerErrors = append(providerErrors, err)
 			return
 		}
 		bytes, _ := json.Marshal(&Status{
@@ -334,11 +330,12 @@ func FetchAndValid(
 
 		url, err := U.Parse(us)
 		if err != nil {
-			providerErrors = append(providerErrors, fmt.Errorf("parse provider %s URL: %w", name, err))
 			return
 		}
 
-		if err := fetchProvider(
+		// Match CMFA: provider prefetch is best-effort. Keep validating the
+		// configuration; Mihomo initializes and updates providers at runtime.
+		_ = fetchProvider(
 			prefix,
 			name,
 			func() (fetchHeader, error) {
@@ -347,20 +344,8 @@ func FetchAndValid(
 			func(name string, value string) {
 				cachefile.Cache().SetSubscriptionInfo(name, value)
 			},
-		); err != nil {
-			fetchErr := fmt.Errorf("fetch provider %s: %w", name, err)
-			if prefix == PROXIES && provider["type"] == "http" && provider["payload"] != nil {
-				// Let the core validate an explicitly configured fallback payload.
-				// A payload's presence alone does not mean it contains usable proxies.
-				payloadFetchErrors[name] = fetchErr
-			} else {
-				providerErrors = append(providerErrors, fetchErr)
-			}
-		}
+		)
 	})
-	if err := errors.Join(providerErrors...); err != nil {
-		return err
-	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -383,14 +368,7 @@ func FetchAndValid(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	for name, fetchErr := range payloadFetchErrors {
-		fallback := cfg.Providers[name]
-		if fallback == nil || len(fallback.Proxies()) == 0 {
-			providerErrors = append(providerErrors, fetchErr)
-		}
-	}
-
-	return errors.Join(providerErrors...)
+	return nil
 }
 
 func (options FetchOptions) requestDialer() (C.Dialer, error) {
