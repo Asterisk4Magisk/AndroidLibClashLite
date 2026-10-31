@@ -9,6 +9,7 @@ import os
 import pathlib
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -104,6 +105,11 @@ def build(args, work):
         target_env[f'CFLAGS_{key}'] = f'--target={compiler_target}'
         target_env[f'CXXFLAGS_{key}'] = f'--target={compiler_target}'
         target_env[f'AR_{key}'] = str(bin_dir / ('llvm-ar' + suffix))
+        # Host libclang does not inherit the NDK compiler's target or sysroot.
+        target_env[f'BINDGEN_EXTRA_CLANG_ARGS_{key}'] = shlex.join([
+            f'--target={compiler_target}',
+            f'--sysroot={(bin_dir.parent / "sysroot").as_posix()}',
+        ])
         wrapper = work / 'toolchains' / (rust_target + '.cmake')
         wrapper.write_text(
             f'set(ANDROID_ABI {abi})\nset(ANDROID_PLATFORM android-{args.api})\n'

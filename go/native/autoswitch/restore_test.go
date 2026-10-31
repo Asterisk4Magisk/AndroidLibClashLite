@@ -95,11 +95,15 @@ func TestRestoreKeepsFirstOriginAcrossSwitches(t *testing.T) {
 
 func TestManualSelectionCancelsRestore(t *testing.T) {
 	server := newServer(t)
-	selector := installGroup(t, server, "A", map[string]bool{"A": false, "B": true, "C": true})
+	selector := installGroup(t, server, "A", map[string]bool{"A": false, "B": true, "C": false})
 	c := newRestoreChecker(t, server.URL, true)
 	ctx := context.Background()
 
 	c.round(ctx)
+	if selector.Now() != "B" {
+		t.Fatalf("selection = %s", selector.Now())
+	}
+	setHealthy(t, "C", true)
 	if err := selector.Set("C"); err != nil {
 		t.Fatal(err)
 	}
