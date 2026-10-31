@@ -1,0 +1,355 @@
+--- a/crates/meow-dns/src/lib.rs
++++ b/crates/meow-dns/src/lib.rs
+@@ -9,6 +9,7 @@
+ pub mod host_resolver_hook;
+ pub mod resolver;
+ pub mod server;
++pub mod system_dns;
+ pub mod upstream;
+ 
+ pub use cache::{DnsCache, DnsCacheSnapshotEntry, ReverseSnapshotEntry};
+--- a/crates/meow-dns/src/upstream.rs
++++ b/crates/meow-dns/src/upstream.rs
+@@ -7,6 +7,8 @@
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ #[non_exhaustive]
+ pub enum NameServerUrl {
++    /// Dynamically supplied physical-network DNS servers.
++    System,
+     Udp {
+         addr: HostOrIp,
+         port: u16,
+@@ -51,6 +53,7 @@
+ impl fmt::Display for NameServerUrl {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         match self {
++            NameServerUrl::System => f.write_str("system"),
+             NameServerUrl::Udp { addr, port } => write!(f, "udp://{addr}:{port}"),
+             NameServerUrl::Tcp { addr, port } => write!(f, "tcp://{addr}:{port}"),
+             NameServerUrl::Tls { addr, port, sni } => write!(f, "tls://{addr}:{port}#{sni}"),
+@@ -281,7 +284,7 @@
+             | NameServerUrl::Tcp { addr, .. }
+             | NameServerUrl::Tls { addr, .. }
+             | NameServerUrl::Https { addr, .. } => addr,
+-            NameServerUrl::RCode { .. } => return None,
++            NameServerUrl::RCode { .. } | NameServerUrl::System => return None,
+         };
+         match addr {
+             HostOrIp::Host(h) => Some(h.as_str()),
+@@ -293,7 +296,10 @@
+     pub fn is_plain(&self) -> bool {
+         matches!(
+             self,
+-            NameServerUrl::Udp { .. } | NameServerUrl::Tcp { .. } | NameServerUrl::RCode { .. }
++            NameServerUrl::System
++                | NameServerUrl::Udp { .. }
++                | NameServerUrl::Tcp { .. }
++                | NameServerUrl::RCode { .. }
+         )
+     }
+ 
+@@ -310,6 +316,10 @@
+         let s = s.trim();
+         if s.is_empty() {
+             return Err(NameServerParseError::EmptyInput);
++        }
++
++        if s == "system" || s == "system://" {
++            return Ok(Self::System);
+         }
+ 
+         // Split off #fragment before any URL parsing — the fragment is NOT a
+--- a/crates/meow-dns/src/resolver.rs
++++ b/crates/meow-dns/src/resolver.rs
+@@ -376,6 +376,7 @@
+             };
+             SocketAddr::new(ip, 53)
+         }
++        NameServerUrl::System => unreachable!("system DNS is dynamic"),
+         NameServerUrl::RCode { .. } => {
+             unreachable!("rcode default-nameserver does not have a socket address")
+         }
+@@ -392,7 +393,10 @@
+ /// unconfigured environment. This mirrors mihomo's behaviour and the helper of
+ /// the same name in `meow-config::ech_dns`; the logic is duplicated rather than
+ /// shared because `meow-config` depends on `meow-dns`, not the reverse.
+-async fn system_nameservers() -> Vec<SocketAddr> {
++pub(crate) async fn system_nameservers() -> Vec<SocketAddr> {
++    if let Some(servers) = crate::system_dns::servers() {
++        return servers.as_ref().clone();
++    }
+     let mut out = Vec::new();
+     #[cfg(unix)]
+     {
+@@ -1020,6 +1024,7 @@
+                     .iter()
+                     .map(|ns| {
+                         let c = match ns {
++                            NameServerUrl::System => DnsClient::system(),
+                             NameServerUrl::RCode { code, .. } => DnsClient::rcode(*code),
+                             NameServerUrl::Tcp { .. } => {
+                                 DnsClient::tcp(url_to_plain_socketaddr(ns))
+@@ -1140,6 +1145,13 @@
+         resolved: &HashMap<String, IpAddr>,
+         proxy: Option<Arc<dyn meow_common::Proxy>>,
+     ) -> Arc<DnsClient> {
++        if matches!(url, NameServerUrl::System) {
++            let client = DnsClient::system();
++            return Arc::new(match proxy {
++                Some(p) => client.with_proxy(p),
++                None => client,
++            });
++        }
+         let (socket_addr, proxy_target) = match url {
+             NameServerUrl::Udp { addr, port }
+             | NameServerUrl::Tcp { addr, port }
+@@ -1177,6 +1189,7 @@
+                 };
+                 (SocketAddr::new(ip, *port), proxy_target)
+             }
++            NameServerUrl::System => unreachable!(),
+             NameServerUrl::RCode { code, .. } => {
+                 let client = DnsClient::rcode(*code);
+                 let client = match proxy {
+@@ -1218,7 +1231,7 @@
+                     )
+                 }
+             }
+-            NameServerUrl::RCode { .. } => {
++            NameServerUrl::System | NameServerUrl::RCode { .. } => {
+                 unreachable!("rcode nameservers return before socket client construction")
+             }
+         };
+--- a/crates/meow-dns/src/client.rs
++++ b/crates/meow-dns/src/client.rs
+@@ -136,6 +136,10 @@
+     /// Bind an unconnected UDP socket. Implementations typically bind to
+     /// `0.0.0.0:0`.
+     fn bind_udp(&self) -> BoxFuture<'_, io::Result<UdpSocket>>;
++    /// Address-family-aware variant; existing custom factories retain their hook.
++    fn bind_udp_for(&self, _peer: SocketAddr) -> BoxFuture<'_, io::Result<UdpSocket>> {
++        self.bind_udp()
++    }
+ 
+     /// Open an outbound TCP connection to `addr`.
+     fn connect_tcp(&self, addr: SocketAddr) -> BoxFuture<'_, io::Result<TcpStream>>;
+@@ -147,6 +151,17 @@
+ struct DefaultSocketFactory;
+ 
+ impl SocketFactory for DefaultSocketFactory {
++    fn bind_udp_for(&self, peer: SocketAddr) -> BoxFuture<'_, io::Result<UdpSocket>> {
++        Box::pin(async move {
++            let local = if peer.is_ipv4() {
++                "0.0.0.0:0"
++            } else {
++                "[::]:0"
++            };
++            meow_common::bind_udp(local).await
++        })
++    }
++
+     fn bind_udp(&self) -> BoxFuture<'_, io::Result<UdpSocket>> {
+         Box::pin(async {
+             // Bind to v4 unspecified; this is fine because we always
+@@ -538,6 +553,7 @@
+ }
+ 
+ enum Transport {
++    System,
+     Udp {
+         addr: SocketAddr,
+     },
+@@ -570,12 +586,33 @@
+             Self::Udp { addr } | Self::Tcp { addr } => *addr,
+             #[cfg(feature = "encrypted")]
+             Self::Dot { addr, .. } | Self::Doh { addr, .. } => *addr,
+-            Self::RCode { .. } => unreachable!("rcode transport has no dial address"),
++            Self::System | Self::RCode { .. } => {
++                unreachable!("transport has no fixed dial address")
++            }
+         }
+     }
+ }
+ 
+ impl DnsClient {
++    pub fn system() -> Self {
++        Self {
++            transport: Transport::System,
++            timeout: DEFAULT_QUERY_TIMEOUT,
++            proxy: None,
++            proxy_target: None,
++            #[cfg(feature = "encrypted")]
++            tls_extra_roots: Vec::new(),
++            label: Some(Arc::from("system")),
++            tcp_pool: Pool::new(TCP_POOL_CAPACITY, TCP_POOL_IDLE_TIMEOUT),
++            #[cfg(feature = "encrypted")]
++            tls_pool: Pool::new(TLS_POOL_CAPACITY, TLS_POOL_IDLE_TIMEOUT),
++            #[cfg(feature = "encrypted")]
++            tls_pool_disabled: false,
++            #[cfg(all(feature = "encrypted", any(test, debug_assertions)))]
++            probe_dead: std::sync::atomic::AtomicUsize::new(0),
++        }
++    }
++
+     /// Plain DNS over UDP.
+     pub fn udp(addr: SocketAddr) -> Self {
+         Self {
+@@ -815,6 +852,7 @@
+                     }
+                     None => socket_label(*addr, 53),
+                 },
++                Transport::System => "system".into(),
+                 Transport::RCode { code } => format!("rcode:{code:?}"),
+                 #[cfg(feature = "encrypted")]
+                 Transport::Dot { addr, sni, .. } => {
+@@ -1415,8 +1453,44 @@
+         wire: &[u8],
+         expected: &ExpectedResponse,
+     ) -> Result<Message, ClientError> {
++        if matches!(self.transport, Transport::System) {
++            use futures::stream::{FuturesUnordered, StreamExt};
++            let generation = crate::system_dns::generation();
++            let addresses = crate::resolver::system_nameservers().await;
++            let mut pending = FuturesUnordered::new();
++            for address in addresses {
++                pending.push(async move {
++                    if let Some(proxy) = &self.proxy {
++                        let response = Self::tcp(address).proxy_tcp_exchange(proxy, wire).await?;
++                        decode_validated_response(&response, expected)
++                    } else {
++                        udp_exchange(address, wire, expected).await
++                    }
++                });
++            }
++            let mut error = None;
++            while let Some(result) = pending.next().await {
++                if generation != crate::system_dns::generation() {
++                    return Err(ClientError::Io(io::Error::new(
++                        io::ErrorKind::Interrupted,
++                        "system DNS changed",
++                    )));
++                }
++                match result {
++                    Ok(response) => return Ok(response),
++                    Err(e) => error = prefer_errno(error, Some(e)),
++                }
++            }
++            return Err(error.unwrap_or_else(|| {
++                ClientError::Io(io::Error::new(
++                    io::ErrorKind::NotConnected,
++                    "no physical-network DNS servers",
++                ))
++            }));
++        }
+         if let Some(proxy) = self.proxy.as_ref() {
+             match &self.transport {
++                Transport::System => unreachable!(),
+                 Transport::Udp { .. } | Transport::Tcp { .. } => {
+                     let response = self.proxy_tcp_exchange(proxy, wire).await?;
+                     return decode_validated_response(&response, expected);
+@@ -1433,6 +1507,7 @@
+             }
+         }
+         match &self.transport {
++            Transport::System => unreachable!(),
+             Transport::Udp { addr } => udp_exchange(*addr, wire, expected).await,
+             Transport::Tcp { addr } => self.tcp_exchange_pooled(*addr, wire, expected).await,
+             Transport::RCode { .. } => Err(ClientError::Protocol(
+@@ -1757,7 +1832,7 @@
+         };
+         UdpSocket::bind(local).await?
+     } else {
+-        factory().bind_udp().await?
++        factory().bind_udp_for(addr).await?
+     };
+     sock.connect(addr).await?;
+     sock.send(wire).await?;
+--- a/crates/meow-dns/src/cache.rs
++++ b/crates/meow-dns/src/cache.rs
+@@ -271,6 +271,7 @@
+ const SHARD_MASK: usize = SHARDS - 1;
+ 
+ pub struct DnsCache {
++    network_generation: Mutex<usize>,
+     cache: [Mutex<LruCache<Arc<str>, CacheEntry>>; SHARDS],
+     /// Reverse mapping: IP → domain (for DNS snooping / tproxy hostname recovery).
+     /// Bounded per-shard LRU — entries past capacity are evicted in
+@@ -374,8 +375,18 @@
+ }
+ 
+ impl DnsCache {
++    fn refresh_network(&self) {
++        let mut previous = self.network_generation.lock();
++        let generation = crate::system_dns::generation();
++        if *previous != generation {
++            self.clear();
++            *previous = generation;
++        }
++    }
++
+     pub fn new(capacity: usize) -> Self {
+         Self {
++            network_generation: Mutex::new(crate::system_dns::generation()),
+             cache: std::array::from_fn(|_| Mutex::new(LruCache::unbounded())),
+             reverse: std::array::from_fn(|_| Mutex::new(LruCache::unbounded())),
+             fwd_shard_cap: per_shard_cap(capacity.max(SHARDS), 8),
+@@ -398,6 +409,7 @@
+     }
+ 
+     pub(crate) fn get_lookup(&self, domain: &str) -> Option<CacheLookup> {
++        self.refresh_network();
+         let domain = normalize_domain(domain);
+         let shard = &self.cache[shard_str(&domain)];
+         let mut cache = shard.lock();
+@@ -716,6 +728,7 @@
+ 
+     /// Reverse lookup: given an IP, return the domain that resolved to it.
+     pub fn reverse_lookup(&self, ip: IpAddr) -> Option<SmolStr> {
++        self.refresh_network();
+         let shard = &self.reverse[shard_ip(ip)];
+         let mut reverse = shard.lock();
+         let now = Instant::now();
+--- /dev/null
++++ b/crates/meow-dns/src/system_dns.rs
+@@ -0,0 +1,29 @@
++//! Physical-network resolver snapshots supplied by an Android embedder.
++use std::{
++    net::SocketAddr,
++    sync::{
++        atomic::{AtomicUsize, Ordering},
++        Arc, LazyLock, RwLock,
++    },
++};
++
++static SERVERS: LazyLock<RwLock<Option<Arc<Vec<SocketAddr>>>>> = LazyLock::new(|| {
++    RwLock::new(if cfg!(target_os = "android") {
++        Some(Arc::new(Vec::new()))
++    } else {
++        None
++    })
++});
++static GENERATION: AtomicUsize = AtomicUsize::new(0);
++
++pub fn update(servers: Vec<SocketAddr>) {
++    *SERVERS.write().unwrap() = Some(Arc::new(servers));
++    GENERATION.fetch_add(1, Ordering::AcqRel);
++    crate::reset_pooled_connections();
++}
++pub fn servers() -> Option<Arc<Vec<SocketAddr>>> {
++    SERVERS.read().unwrap().clone()
++}
++pub(crate) fn generation() -> usize {
++    GENERATION.load(Ordering::Acquire)
++}
+--- a/crates/meow-config/src/ech_dns.rs
++++ b/crates/meow-config/src/ech_dns.rs
+@@ -105,6 +105,9 @@
+ /// missing / unreadable resolv.conf) fall back to a short list of well-known
+ /// public resolvers so ECH lookups still succeed in unconfigured environments.
+ async fn system_nameservers() -> Vec<SocketAddr> {
++    if let Some(servers) = meow_dns::system_dns::servers() {
++        return servers.as_ref().clone();
++    }
+     let mut out = Vec::new();
+     #[cfg(unix)]
+     {

@@ -1,0 +1,396 @@
+// Copyright 2026, Asterisk4Magisk contributors
+// SPDX-License-Identifier: LGPL-3.0
+
+package config
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	U "net/url"
+	"os"
+	P "path"
+	"runtime"
+	"strconv"
+	"strings"
+	"time"
+
+	"cfa/native/app"
+
+	"cfa/native/subscription"
+	A "github.com/metacubex/mihomo/adapter/outbound"
+	"github.com/metacubex/mihomo/adapter/provider"
+	"github.com/metacubex/mihomo/component/dialer"
+	"github.com/metacubex/mihomo/component/profile/cachefile"
+	"github.com/metacubex/mihomo/component/proxydialer"
+	C "github.com/metacubex/mihomo/constant"
+	RB "github.com/metacubex/mihomo/rules/bundle"
+)
+
+type FetchProxy struct {
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type FetchOptions struct {
+	Force     bool        `json:"force"`
+	UserAgent string      `json:"userAgent"`
+	Hwid      string      `json:"hwid"`
+	Proxy     *FetchProxy `json:"proxy"`
+}
+
+type Status struct {
+	Action            string   `json:"action"`
+	Args              []string `json:"args"`
+	Progress          int      `json:"progress"`
+	MaxProgress       int      `json:"max"`
+	SubUpload         *int64   `json:"subUpload,omitempty"`
+	SubDownload       *int64   `json:"subDownload,omitempty"`
+	SubTotal          *int64   `json:"subTotal,omitempty"`
+	SubExpire         *int64   `json:"subExpire,omitempty"`
+	SubUpdateInterval *int64   `json:"subUpdateInterval,omitempty"`
+
+	// SubContentDisposition is the primary subscription's raw header. Clients
+	// decode the filename so they can tolerate non-conformant server values.
+	SubContentDisposition *string `json:"subContentDisposition,omitempty"`
+}
+
+type fetchHeader struct {
+	SubscriptionUserInfo  string
+	ProfileUpdateInterval string
+	ContentDisposition    string
+}
+
+func openUrl(ctx context.Context, url string, userAgent string, hwid string, requestDialer C.Dialer) (io.ReadCloser, fetchHeader, error) {
+	response, err := subscription.Get(ctx, url, userAgent, hwid, requestDialer.DialContext)
+	if err != nil {
+		return nil, fetchHeader{}, err
+	}
+
+	return response.Body, fetchHeader{
+		SubscriptionUserInfo:  response.Header.Get("subscription-userinfo"),
+		ProfileUpdateInterval: response.Header.Get("profile-update-interval"),
+		ContentDisposition:    response.Header.Get("content-disposition"),
+	}, nil
+}
+
+func openContent(url string) (io.ReadCloser, error) {
+	return app.OpenContent(url)
+}
+
+func fetch(ctx context.Context, url *U.URL, file string, userAgent string, hwid string, requestDialer C.Dialer) (fetchHeader, error) {
+	if err := ctx.Err(); err != nil {
+		return fetchHeader{}, err
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+
+	var reader io.ReadCloser
+	var header fetchHeader
+	var err error
+
+	switch url.Scheme {
+	case "http", "https":
+		reader, header, err = openUrl(requestCtx, url.String(), userAgent, hwid, requestDialer)
+	case "content":
+		// Descriptor acquisition is synchronous in the Android resolver API.
+		// Once acquired, closing the descriptor can interrupt a blocked read.
+		reader, err = openContent(url.String())
+	default:
+		err = fmt.Errorf("unsupported scheme %s of %s", url.Scheme, url)
+	}
+
+	if err != nil {
+		return fetchHeader{}, err
+	}
+
+	defer reader.Close()
+
+	if err := requestCtx.Err(); err != nil {
+		return header, err
+	}
+	if url.Scheme == "content" {
+		stop := context.AfterFunc(requestCtx, func() { _ = reader.Close() })
+		defer stop()
+	}
+
+	err = writeFile(file, reader)
+	if ctxErr := requestCtx.Err(); ctxErr != nil {
+		return header, ctxErr
+	}
+	return header, err
+}
+
+func fetchProvider(
+	prefix string,
+	name string,
+	download func() (fetchHeader, error),
+	store func(string, string),
+) error {
+	header, err := download()
+	if err != nil {
+		return err
+	}
+	if prefix == PROXIES && header.SubscriptionUserInfo != "" {
+		store(name, header.SubscriptionUserInfo)
+	}
+	return nil
+}
+
+func writeFile(file string, reader io.Reader) error {
+	_ = os.MkdirAll(P.Dir(file), 0700)
+
+	f, err := os.OpenFile(file, os.O_WRONLY|os.O_TRUNC|os.O_CREATE, 0600)
+	if err != nil {
+		return err
+	}
+
+	defer f.Close()
+
+	_, err = io.Copy(f, reader)
+	if err != nil {
+		_ = os.Remove(file)
+	}
+
+	return err
+}
+
+func parseProfileUpdateInterval(value string) (int64, bool) {
+	hours, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+
+	if hours <= 0 {
+		return 0, true
+	}
+
+	interval := time.Duration(hours) * time.Hour
+	if interval < 15*time.Minute {
+		interval = 15 * time.Minute
+	}
+
+	return int64(interval / time.Millisecond), true
+}
+
+func reportSubscriptionInfo(header fetchHeader, reportStatus func(string)) {
+	userinfo := header.SubscriptionUserInfo
+	updateIntervalHeader := header.ProfileUpdateInterval
+	contentDisposition := strings.TrimSpace(header.ContentDisposition)
+	if userinfo == "" && updateIntervalHeader == "" && contentDisposition == "" {
+		return
+	}
+
+	status := Status{
+		Action:      "SubscriptionInfo",
+		Args:        []string{},
+		Progress:    -1,
+		MaxProgress: -1,
+	}
+
+	if userinfo != "" {
+		info := provider.NewSubscriptionInfo(userinfo)
+		expire := info.Expire * 1000
+		status.SubUpload = &info.Upload
+		status.SubDownload = &info.Download
+		status.SubTotal = &info.Total
+		status.SubExpire = &expire
+	}
+
+	if interval, ok := parseProfileUpdateInterval(updateIntervalHeader); ok {
+		status.SubUpdateInterval = &interval
+	}
+
+	if contentDisposition != "" {
+		status.SubContentDisposition = &contentDisposition
+	}
+
+	bytes, _ := json.Marshal(&status)
+	reportStatus(string(bytes))
+}
+
+func FetchAndValid(
+	ctx context.Context,
+	path string,
+	url string,
+	options FetchOptions,
+	reportStatus func(string),
+) error {
+	requestDialer, err := options.requestDialer()
+	if err != nil {
+		return err
+	}
+	defaultUserAgent := "ClashMetaForAndroid/" + app.VersionName()
+	mainUserAgent := strings.TrimSpace(options.UserAgent)
+	if mainUserAgent == "" {
+		mainUserAgent = defaultUserAgent
+	}
+	configPath := P.Join(path, "config.yaml")
+
+	if _, err := os.Stat(configPath); os.IsNotExist(err) || options.Force {
+		url, err := U.Parse(url)
+		if err != nil {
+			return err
+		}
+
+		bytes, _ := json.Marshal(&Status{
+			Action:      "FetchConfiguration",
+			Args:        []string{url.Host},
+			Progress:    -1,
+			MaxProgress: -1,
+		})
+
+		reportStatus(string(bytes))
+
+		header, err := fetch(ctx, url, configPath, mainUserAgent, options.Hwid, requestDialer)
+		if err != nil {
+			return err
+		}
+
+		reportSubscriptionInfo(header, reportStatus)
+	}
+
+	defer runtime.GC()
+
+	statusBytes, _ := json.Marshal(&Status{
+		Action:      "Decrypting",
+		Args:        []string{},
+		Progress:    -1,
+		MaxProgress: -1,
+	})
+	reportStatus(string(statusBytes))
+
+	configData, err := os.ReadFile(configPath)
+	if err != nil {
+		return err
+	}
+	configData, err = DecryptBytes(configData)
+	if err != nil {
+		return err
+	}
+
+	statusBytes, _ = json.Marshal(&Status{
+		Action:      "Verifying",
+		Args:        []string{},
+		Progress:    -1,
+		MaxProgress: -1,
+	})
+	reportStatus(string(statusBytes))
+
+	rawCfg, err := UnmarshalAndPatchBytes(path, configData)
+	if err != nil {
+		return err
+	}
+
+	forEachProviders(rawCfg, func(index int, total int, name string, provider map[string]any, prefix string) {
+		if err := ctx.Err(); err != nil {
+			return
+		}
+		bytes, _ := json.Marshal(&Status{
+			Action:      "FetchProviders",
+			Args:        []string{name},
+			Progress:    index,
+			MaxProgress: total,
+		})
+
+		reportStatus(string(bytes))
+
+		u, uok := provider["url"]
+		p, pok := provider["path"]
+
+		if !uok || !pok {
+			return
+		}
+
+		us, uok := u.(string)
+		ps, pok := p.(string)
+
+		if !uok || !pok {
+			return
+		}
+
+		if _, err := os.Stat(ps); err == nil {
+			return
+		}
+
+		if prefix == RULES {
+			if pib, uok := provider["path-in-bundle"]; uok {
+				if pib, uok := pib.(string); uok && pib != "" {
+					// The core extracts files from the bundle, but CMFA fetches provider
+					// content during profile loading, so keep that observable behavior.
+					if file, err := RB.Open(pib); err == nil {
+						defer file.Close()
+						if err := writeFile(ps, file); err == nil {
+							return
+						}
+					}
+				}
+			}
+		}
+
+		url, err := U.Parse(us)
+		if err != nil {
+			return
+		}
+
+		// Match CMFA: provider prefetch is best-effort. Keep validating the
+		// configuration; Mihomo initializes and updates providers at runtime.
+		_ = fetchProvider(
+			prefix,
+			name,
+			func() (fetchHeader, error) {
+				return fetch(ctx, url, ps, defaultUserAgent, "", requestDialer)
+			},
+			func(name string, value string) {
+				cachefile.Cache().SetSubscriptionInfo(name, value)
+			},
+		)
+	})
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	statusBytes, _ = json.Marshal(&Status{
+		Action:      "Verifying",
+		Args:        []string{},
+		Progress:    0xffff,
+		MaxProgress: 0xffff,
+	})
+
+	reportStatus(string(statusBytes))
+
+	cfg, err := Parse(rawCfg)
+	if err != nil {
+		return err
+	}
+	defer destroyProviders(cfg)
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (options FetchOptions) requestDialer() (C.Dialer, error) {
+	if options.Proxy == nil {
+		return dialer.NewDialer(), nil
+	}
+	proxy := options.Proxy
+	if strings.TrimSpace(proxy.Host) == "" || proxy.Port <= 0 || proxy.Port > 65535 {
+		return nil, fmt.Errorf("invalid fetch proxy address")
+	}
+	adapter, err := A.NewSocks5(A.Socks5Option{
+		Name:     "AndroidClash subscription fetch",
+		Server:   proxy.Host,
+		Port:     proxy.Port,
+		UserName: proxy.Username,
+		Password: proxy.Password,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return proxydialer.New(adapter, false), nil
+}

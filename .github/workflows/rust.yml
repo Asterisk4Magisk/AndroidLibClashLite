@@ -1,0 +1,74 @@
+name: Build meow
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Read pinned toolchain
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, tomllib
+          toolchain = tomllib.loads(pathlib.Path('rust/rust-toolchain.toml').read_text())['toolchain']['channel']
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write('RUSTUP_TOOLCHAIN=' + toolchain + '\n')
+          PY
+
+      - name: Setup Rust and native build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libclang-dev
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt
+          rustup target add --toolchain "$RUSTUP_TOOLCHAIN" \
+            armv7-linux-androideabi aarch64-linux-android i686-linux-android x86_64-linux-android
+
+      - name: Rust checks
+        working-directory: rust
+        run: |
+          python3 ../scripts/prepare_rust.py
+          cargo fmt --all -- --check
+          cargo test --locked
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: android-actions/setup-android@v4
+        with:
+          log-accepted-android-sdk-licenses: false
+          cmdline-tools-version: '14742923'
+          packages: 'platform-tools'
+
+      - name: Install NDK
+        run: |
+          sdkmanager 'ndk;28.2.13676358' 'platforms;android-37.0' 'build-tools;37.0.0'
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
+
+      - name: Build four ABI AAR
+        run: |
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          python3 scripts/build_rust.py
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: libclash-rs
+          path: |
+            libclash-rs.aar
+            libclash-rs-sources.jar
+          if-no-files-found: error
+

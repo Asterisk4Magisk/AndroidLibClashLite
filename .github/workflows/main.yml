@@ -1,18 +1,20 @@
-name: Build
+name: Build and Release
 
 on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Optional release tag (e.g. v1.19.31 or v1.19.31-android.1)
+        description: Optional release tag matching go/go.mod, optionally with -android.N
         required: false
         type: string
   pull_request:
     branches:
       - main
+    paths: ['go/**', 'rust/**', 'android/**', 'scripts/**', '.github/workflows/**']
   push:
     branches:
       - main
+    paths: ['go/**', 'rust/**', 'android/**', 'scripts/**', '.github/workflows/**']
 
 permissions:
   contents: read
@@ -22,7 +24,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
+  go:
+    uses: ./.github/workflows/go.yml
+
+  rust:
+    uses: ./.github/workflows/rust.yml
+
+  release:
+    needs: [go, rust]
+    if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -34,59 +44,29 @@ jobs:
           persist-credentials: false
 
       - name: Validate release tag
-        if: inputs.release_tag != ''
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           python3 - <<'PY'
           import os, pathlib, re
-          core = re.search(r'github.com/metacubex/mihomo\s+(\S+)', pathlib.Path('go.mod').read_text()).group(1)
+          core = re.search(r'github.com/metacubex/mihomo\s+(\S+)', pathlib.Path('go/go.mod').read_text()).group(1)
           if not re.fullmatch(re.escape(core) + r'(?:-android\.[1-9]\d*)?', os.environ['RELEASE_TAG']):
               raise SystemExit('Release tag must match the pinned core, optionally with -android.N')
           PY
 
-      - name: Setup Golang
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          check-latest: true
-
-      - name: Setup Java
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: '21'
-          check-latest: true
-
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v4
-        with:
-          log-accepted-android-sdk-licenses: false
-          cmdline-tools-version: '14742923'
-          packages: 'platforms;android-37.0 build-tools;37.0.0 platform-tools'
-
-      - name: Install NDK
-        run: |
-          sdkmanager 'ndk;28.2.13676358'
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
-
-      - name: Build
-        run: |
-          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
-          python3 scripts/build_shared.py
-
-      - name: Upload build artifacts
-        if: inputs.release_tag == ''
-        uses: actions/upload-artifact@v7
+      - name: Download Go artifacts
+        uses: actions/download-artifact@v8
         with:
           name: libclash
-          path: |
-            libclash.aar
-            libclash-sources.jar
-          if-no-files-found: error
+          path: artifacts
+
+      - name: Download Rust artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: libclash-rs
+          path: artifacts
 
       - name: Create release tag
-        if: inputs.release_tag != ''
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag }}
@@ -100,8 +80,7 @@ jobs:
           fi
           git push origin "refs/tags/$RELEASE_TAG"
 
-      - name: Upload AndroidLibClashLite to release
-        if: inputs.release_tag != ''
+      - name: Publish both AARs
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -115,5 +94,7 @@ jobs:
           else
             gh release create "$RELEASE_TAG" --verify-tag --draft --generate-notes
           fi
-          gh release upload "$RELEASE_TAG" libclash.aar libclash-sources.jar --clobber
+          gh release upload "$RELEASE_TAG" \
+            artifacts/libclash.aar artifacts/libclash-sources.jar \
+            artifacts/libclash-rs.aar artifacts/libclash-rs-sources.jar --clobber
           gh release edit "$RELEASE_TAG" --draft=false

@@ -1,0 +1,992 @@
+--- a/crates/meow-listener/src/tproxy/mod.rs
++++ b/crates/meow-listener/src/tproxy/mod.rs
+@@ -58,7 +58,7 @@
+     bound_addr: SocketAddr,
+     firewall: Option<FirewallGuard>,
+     /// Bound `IP_TRANSPARENT` UDP socket (Linux `udp: true` only).
+-    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "android"))]
+     udp_socket: Option<tokio::net::UdpSocket>,
+ }
+ 
+@@ -173,7 +173,7 @@
+         // `FirewallGuard::setup` doubles as the unsupported-platform gate —
+         // `firewall: false` must not smuggle a dead listener onto a platform
+         // where orig-dest recovery cannot work, so keep the gate explicit.
+-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
++        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+         if !self.firewall {
+             return Err("transparent proxy is not supported on this platform".into());
+         }
+@@ -209,7 +209,7 @@
+                 // recovery can work — on other platforms the external
+                 // gate above refuses too, so don't send users down a
+                 // dead end.
+-                #[cfg(any(target_os = "macos", target_os = "linux"))]
++                #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
+                 let e = format!(
+                     "{e} — to manage firewall rules externally (no nft/pfctl \
+                      required), declare this listener under `listeners:` \
+@@ -224,9 +224,9 @@
+ 
+         // #564: opt-in Linux UDP TPROXY datagram path on the same bound
+         // port. Both invariants are re-enforced here even though config
+-        // parsing already rejects `udp` + managed firewall and non-IPv4
+-        // binds — programmatic constructors get the same contract.
+-        #[cfg(target_os = "linux")]
++        // parsing already rejects `udp` + managed firewall (and non-IPv4
++        // binds on Linux) — programmatic constructors get the same contract.
++        #[cfg(any(target_os = "linux", target_os = "android"))]
+         let udp_socket = if self.udp {
+             Some(udp::bind_transparent(bound_addr).map_err(
+                 |e| -> Box<dyn std::error::Error + Send + Sync> {
+@@ -240,7 +240,7 @@
+         } else {
+             None
+         };
+-        #[cfg(not(target_os = "linux"))]
++        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+         if self.udp {
+             return Err("tproxy `udp: true` is Linux-only in this release".into());
+         }
+@@ -248,7 +248,7 @@
+         self.prepared = Some(Prepared {
+             bound_addr,
+             firewall,
+-            #[cfg(target_os = "linux")]
++            #[cfg(any(target_os = "linux", target_os = "android"))]
+             udp_socket,
+         });
+         Ok(self)
+@@ -282,7 +282,7 @@
+         // The guard keeps the managed ruleset alive for the loop's lifetime.
+         let _firewall = prepared.firewall;
+ 
+-        #[cfg(target_os = "linux")]
++        #[cfg(any(target_os = "linux", target_os = "android"))]
+         if let Some(udp_socket) = prepared.udp_socket {
+             let udp_tunnel = self.tunnel.clone();
+             let udp_timeout = self.udp_timeout;
+@@ -324,7 +324,7 @@
+         if !self.firewall {
+             info!(
+                 "TProxy listener '{}': external firewall management — no rules \
+-                 installed or cleaned up; TCP REDIRECT (and loop-prevention \
++                 installed or cleaned up; TCP steering (and loop-prevention \
+                  bypass) is the deployer's responsibility",
+                 self.name
+             );
+@@ -876,7 +876,7 @@
+     ///
+     /// Also pins the startup-log disclosure ("external firewall management")
+     /// that the Docker harness greps for (`tests/tproxy-docker/guest-init.sh`).
+-    #[cfg(any(target_os = "linux", target_os = "macos"))]
++    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+     #[test]
+     fn run_on_external_firewall_accepts_without_setup() {
+         #[derive(Clone)]
+@@ -959,7 +959,7 @@
+     /// `prepare(A)` then `run_on(socket bound to B)` must hard-error —
+     /// the prepared firewall/UDP artifacts would otherwise silently
+     /// target a port nothing accepts on (#641 review follow-up).
+-    #[cfg(any(target_os = "linux", target_os = "macos"))]
++    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+     #[test]
+     fn run_on_rejects_prepared_addr_mismatch() {
+         tokio::runtime::Builder::new_current_thread()
+@@ -1001,7 +1001,7 @@
+     /// The inverse contract on platforms without orig-dest recovery:
+     /// `firewall: false` must not smuggle a dead listener up — `run_on`
+     /// refuses before accepting (issue #563).
+-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
++    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+     #[tokio::test]
+     async fn run_on_external_firewall_errors_on_unsupported_platform() {
+         let resolver = std::sync::Arc::new(meow_dns::Resolver::new(
+@@ -1036,7 +1036,7 @@
+     /// listener must fail at startup, never silently degrade to TCP-only.
+     /// The positive path (transparent socket + flow dispatch) is exercised
+     /// by the Docker suite, which requires a Linux container.
+-    #[cfg(not(target_os = "linux"))]
++    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+     #[tokio::test]
+     async fn run_on_udp_rejected_off_linux() {
+         let resolver = std::sync::Arc::new(meow_dns::Resolver::new(
+--- a/crates/meow-listener/src/tproxy/udp.rs
++++ b/crates/meow-listener/src/tproxy/udp.rs
+@@ -1,6 +1,6 @@
+ //! UDP TPROXY datagram path for the `tproxy` listener (issue #564).
+ //!
+-//! Linux-only and opt-in (`listeners[].udp: true`); requires
++//! Linux/Android and opt-in (`listeners[].udp: true`); requires
+ //! `firewall: false` — meow never installs the PREROUTING TPROXY rules,
+ //! the matching `ip rule`/`local` route table, or any sysctl. The
+ //! deployment contract is in `docs/tproxy-gateway.md`.
+@@ -32,12 +32,12 @@
+ //! them is genuinely addressed to that destination).
+ //!
+ //! Flow machinery (`relay_udp_flow`, queue bounds) is platform-neutral and
+-//! unit-tested on every OS; the socket/`recvmsg` layer is `cfg(linux)`.
++//! unit-tested on every OS; the socket/`recvmsg` layer is `cfg(linux/android)`.
+ 
+ /// Per-flow routing/relay machinery — platform-neutral so the unit tests
+ /// below exercise it on every OS. In production it is only reachable from
+ /// the Linux socket layer.
+-#[cfg(any(target_os = "linux", test))]
++#[cfg(any(target_os = "linux", target_os = "android", test))]
+ pub(super) mod flow {
+     use std::net::SocketAddr;
+     use std::sync::atomic::{AtomicUsize, Ordering};
+@@ -251,7 +251,7 @@
+     }
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ mod linux {
+     use super::flow::{self, ReplyMsg, DATAGRAM_BUF, FLOW_QUEUE};
+     use meow_common::{Metadata, Network};
+@@ -259,7 +259,7 @@
+     use std::collections::HashMap;
+     use std::io;
+     use std::mem;
+-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
++    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
+     use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+     use std::sync::atomic::{AtomicUsize, Ordering};
+     use std::sync::Arc;
+@@ -563,18 +563,12 @@
+     /// is visible to the TPROXY socket lookup for packets the deployer
+     /// steers via `--on-port` + fwmark/policy-routing) and
+     /// `IP_RECVORIGDSTADDR` (so each datagram carries its original
+-    /// destination in ancillary data). IPv4 only in this release.
++    /// destination in ancillary data). Android also supports IPv6.
+     ///
+     /// `IP_TRANSPARENT` requires `CAP_NET_ADMIN`/`CAP_NET_RAW` — a failure
+     /// here is the explicit permission diagnostic the issue asks for.
+     pub fn bind_transparent(addr: SocketAddr) -> io::Result<UdpSocket> {
+-        let IpAddr::V4(ip) = addr.ip() else {
+-            return Err(io::Error::new(
+-                io::ErrorKind::InvalidInput,
+-                "tproxy udp listener is IPv4-only in this release",
+-            ));
+-        };
+-        let std_sock = transparent_udp_socket(ip, addr.port(), true)?;
++        let std_sock = transparent_udp_socket(addr, true)?;
+         UdpSocket::from_std(std_sock)
+     }
+ 
+@@ -584,24 +578,26 @@
+     /// (local service on that address:port) must surface as an error, not
+     /// silently share the endpoint.
+     pub fn bind_reply_socket(orig_dst: SocketAddr) -> io::Result<UdpSocket> {
+-        let IpAddr::V4(ip) = orig_dst.ip() else {
+-            return Err(io::Error::new(
+-                io::ErrorKind::InvalidInput,
+-                "tproxy udp reply destination is IPv4-only",
+-            ));
+-        };
+-        let std_sock = transparent_udp_socket(ip, orig_dst.port(), false)?;
++        let std_sock = transparent_udp_socket(orig_dst, false)?;
+         UdpSocket::from_std(std_sock)
+     }
+ 
+     fn transparent_udp_socket(
+-        ip: Ipv4Addr,
+-        port: u16,
++        addr: SocketAddr,
+         recv_orig_dst: bool,
+     ) -> io::Result<std::net::UdpSocket> {
++        #[cfg(target_os = "linux")]
++        if addr.is_ipv6() {
++            return Err(io::Error::new(
++                io::ErrorKind::Unsupported,
++                "UDP TPROXY requires IPv4 on Linux",
++            ));
++        }
+         unsafe {
++            let v4 = addr.is_ipv4();
++            let family = if v4 { libc::AF_INET } else { libc::AF_INET6 };
+             let fd = libc::socket(
+-                libc::AF_INET,
++                family,
+                 libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                 0,
+             );
+@@ -612,15 +608,28 @@
+             let sock = std::net::UdpSocket::from_raw_fd(fd);
+ 
+             let one: libc::c_int = 1;
+-            let opts: &[libc::c_int] = if recv_orig_dst {
+-                &[IP_TRANSPARENT, IP_RECVORIGDSTADDR]
++            // Keep IPv4 and IPv6 sockets separate; no mapped-address ambiguity.
++            if !v4
++                && libc::setsockopt(
++                    fd,
++                    libc::SOL_IPV6,
++                    libc::IPV6_V6ONLY,
++                    &one as *const _ as *const libc::c_void,
++                    mem::size_of_val(&one) as _,
++                ) != 0
++            {
++                return Err(io::Error::last_os_error());
++            }
++            let options = if v4 {
++                [IP_TRANSPARENT, IP_RECVORIGDSTADDR]
+             } else {
+-                &[IP_TRANSPARENT]
++                [75, 74]
+             };
++            let opts = &options[..if recv_orig_dst { 2 } else { 1 }];
+             for &opt in opts {
+                 if libc::setsockopt(
+                     fd,
+-                    libc::SOL_IP,
++                    if v4 { libc::SOL_IP } else { libc::SOL_IPV6 },
+                     opt,
+                     &one as *const _ as *const libc::c_void,
+                     mem::size_of_val(&one) as libc::socklen_t,
+@@ -630,30 +639,41 @@
+                 }
+             }
+ 
+-            let sa = libc::sockaddr_in {
+-                sin_family: libc::AF_INET as libc::sa_family_t,
+-                sin_port: port.to_be(),
+-                sin_addr: libc::in_addr {
+-                    s_addr: u32::from_ne_bytes(ip.octets()),
+-                },
+-                sin_zero: [0; 8],
+-            };
+-            if libc::bind(
+-                fd,
+-                &sa as *const _ as *const libc::sockaddr,
+-                mem::size_of_val(&sa) as libc::socklen_t,
+-            ) != 0
+-            {
++            let (storage, length) = socket_address(addr);
++            if libc::bind(fd, &storage as *const _ as *const libc::sockaddr, length) != 0 {
+                 return Err(io::Error::last_os_error());
+             }
+             Ok(sock)
+         }
++    }
++
++    fn socket_address(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
++        let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
++        let length = match addr {
++            SocketAddr::V4(addr) => {
++                let sa = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in) };
++                sa.sin_family = libc::AF_INET as _;
++                sa.sin_port = addr.port().to_be();
++                sa.sin_addr.s_addr = u32::from_ne_bytes(addr.ip().octets());
++                mem::size_of::<libc::sockaddr_in>()
++            }
++            SocketAddr::V6(addr) => {
++                let sa = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in6) };
++                sa.sin6_family = libc::AF_INET6 as _;
++                sa.sin6_port = addr.port().to_be();
++                sa.sin6_addr.s6_addr = addr.ip().octets();
++                sa.sin6_scope_id = addr.scope_id();
++                sa.sin6_flowinfo = addr.flowinfo();
++                mem::size_of::<libc::sockaddr_in6>()
++            }
++        };
++        (storage, length as _)
+     }
+ 
+     /// Receive one datagram plus its `IP_ORIGDSTADDR` original destination.
+     ///
+     /// Returns `Ok(None)` when the datagram must be dropped: truncation,
+-    /// missing/malformed ancillary data, or a non-IPv4 source — never fall
++    /// missing/malformed ancillary data, or an unsupported address family — never fall
+     /// back to treating the listener address as the destination.
+     async fn recv_dgram(
+         socket: &UdpSocket,
+@@ -688,7 +708,7 @@
+         };
+         // Aligned storage: `CMSG_DATA` yields `&sockaddr_in` below, which
+         // requires 4-byte alignment a `[u8; N]` stack slot doesn't guarantee.
+-        let mut cbuf = [0u64; 8]; // 64 bytes, comfortably holds one sockaddr_in cmsg
++        let mut cbuf = [0u64; 16]; // 128 bytes, holds IPv4/IPv6 original-destination cmsgs
+         let mut msg: libc::msghdr = mem::zeroed();
+         msg.msg_name = (&mut name as *mut libc::sockaddr_storage).cast::<libc::c_void>();
+         msg.msg_namelen = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+@@ -711,7 +731,7 @@
+         }
+ 
+         let Some(client) = sockaddr_in_to_addr(&name, msg.msg_namelen) else {
+-            debug!("tproxy UDP: dropping datagram with non-IPv4/short source addr");
++            debug!("tproxy UDP: dropping datagram with invalid/short source addr");
+             return Ok(None);
+         };
+         // Byte view over the aligned control buffer — no copy.
+@@ -746,7 +766,8 @@
+                 if hdr.cmsg_level == libc::SOL_IP
+                     && hdr.cmsg_type == IP_ORIGDSTADDR
+                     && hdr.cmsg_len >= libc::CMSG_LEN(mem::size_of::<libc::sockaddr_in>() as _) as _
+-                    && hdr.cmsg_len <= controllen as _
++                    && (cmsg as usize - cbuf.as_ptr() as usize) + hdr.cmsg_len as usize
++                        <= controllen
+                 {
+                     let sa = &*(libc::CMSG_DATA(cmsg) as *const libc::sockaddr_in);
+                     if sa.sin_family as i32 == libc::AF_INET {
+@@ -755,6 +776,16 @@
+                     // Right level/type but wrong family — malformed.
+                     return None;
+                 }
++                if hdr.cmsg_level == libc::SOL_IPV6
++                    && hdr.cmsg_type == 74
++                    && hdr.cmsg_len
++                        >= libc::CMSG_LEN(mem::size_of::<libc::sockaddr_in6>() as _) as _
++                    && (cmsg as usize - cbuf.as_ptr() as usize) + hdr.cmsg_len as usize
++                        <= controllen
++                {
++                    let sa = &*(libc::CMSG_DATA(cmsg) as *const libc::sockaddr_in6);
++                    return (sa.sin6_family as i32 == libc::AF_INET6).then(|| sockaddr_to_v6(sa));
++                }
+                 cmsg = libc::CMSG_NXTHDR(&fake_msghdr(), cmsg);
+             }
+             None
+@@ -765,6 +796,12 @@
+         name: &libc::sockaddr_storage,
+         namelen: libc::socklen_t,
+     ) -> Option<SocketAddr> {
++        if name.ss_family as i32 == libc::AF_INET6
++            && namelen as usize >= mem::size_of::<libc::sockaddr_in6>()
++        {
++            let sa = unsafe { &*(name as *const _ as *const libc::sockaddr_in6) };
++            return Some(sockaddr_to_v6(sa));
++        }
+         if (namelen as usize) < mem::size_of::<libc::sockaddr_in>() {
+             return None;
+         }
+@@ -773,6 +810,15 @@
+             return None;
+         }
+         Some(sockaddr_to_v4(sa))
++    }
++
++    fn sockaddr_to_v6(sa: &libc::sockaddr_in6) -> SocketAddr {
++        SocketAddr::V6(SocketAddrV6::new(
++            Ipv6Addr::from(sa.sin6_addr.s6_addr),
++            u16::from_be(sa.sin6_port),
++            sa.sin6_flowinfo,
++            sa.sin6_scope_id,
++        ))
+     }
+ 
+     fn sockaddr_to_v4(sa: &libc::sockaddr_in) -> SocketAddr {
+@@ -1142,7 +1188,7 @@
+     }
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ pub use linux::{bind_transparent, run_udp};
+ 
+ #[cfg(test)]
+--- a/crates/meow-listener/src/tproxy/orig_dest.rs
++++ b/crates/meow-listener/src/tproxy/orig_dest.rs
+@@ -7,6 +7,13 @@
+ /// On macOS, queries the pf NAT state table via DIOCNATLOOK.
+ /// On Linux, uses SO_ORIGINAL_DST getsockopt.
+ pub fn get_original_dst(stream: &TcpStream, listen_addr: SocketAddr) -> io::Result<SocketAddr> {
++    #[cfg(target_os = "android")]
++    {
++        // Android embedders supply a transparent TCP socket. TPROXY does
++        // not DNAT: getsockname is the intercepted destination, not conntrack.
++        let _ = listen_addr;
++        stream.local_addr()
++    }
+     #[cfg(target_os = "macos")]
+     {
+         macos::get_original_dst(stream, listen_addr)
+@@ -16,7 +23,7 @@
+         let _ = listen_addr;
+         linux::get_original_dst(stream)
+     }
+-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
++    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+     {
+         let _ = (stream, listen_addr);
+         Err(io::Error::new(
+--- a/crates/meow-config/src/lib.rs
++++ b/crates/meow-config/src/lib.rs
+@@ -4,6 +4,7 @@
+ //! the tunnel, listeners, DNS, and API.
+ 
+ pub mod auth;
++pub mod dns_outbound;
+ pub mod dns_parser;
+ pub mod dropped_providers;
+ pub mod ech_dns;
+@@ -213,7 +214,7 @@
+ /// `ListenerSpec::TProxy::firewall` serde default: managed firewall rules
+ /// stay on when a persisted spec predates the field (issue #563).
+ fn default_tproxy_firewall() -> bool {
+-    true
++    !cfg!(target_os = "android")
+ }
+ 
+ /// `ListenerSpec::TProxy::udp_timeout` serde default, in seconds — matches
+@@ -1977,7 +1978,9 @@
+     !BUILTIN_GLOBAL_POLICIES
+         .iter()
+         .any(|policy| name.eq_ignore_ascii_case(policy))
+-        && proxies.contains_key(name)
++        && proxies
++            .get(name)
++            .is_some_and(|p| p.adapter_type() != AdapterType::Dns)
+ }
+ 
+ /// The target of the LAST top-level `MATCH,<target>` rule — the config's
+@@ -2087,10 +2090,22 @@
+     raw_proxies: &[HashMap<String, serde_json::Value>],
+     ipv6: bool,
+     strict: bool,
++    resolver: Option<&meow_dns::ResolverSlot>,
+ ) -> Result<std::collections::HashSet<SmolStr>, anyhow::Error> {
+     let mut placeholder_names = std::collections::HashSet::new();
+     for raw_proxy in raw_proxies {
+-        let (proxy, placeholder_bound) = match proxy_parser::parse_proxy(raw_proxy, ipv6) {
++        let parsed = if raw_proxy.get("type").and_then(|v| v.as_str()) == Some("dns") {
++            let name = raw_proxy
++                .get("name")
++                .and_then(|v| v.as_str())
++                .unwrap_or("dns-out");
++            Ok(Arc::new(proxy_parser::WrappedProxy::new(Box::new(
++                dns_outbound::DnsAdapter::new(name, resolver.cloned()),
++            ))) as Arc<dyn Proxy>)
++        } else {
++            proxy_parser::parse_proxy(raw_proxy, ipv6)
++        };
++        let (proxy, placeholder_bound) = match parsed {
+             Ok(proxy) => (proxy, false),
+             Err(e) if strict => {
+                 let name = raw_proxy
+@@ -2383,6 +2398,7 @@
+         raw.proxies.as_deref().unwrap_or(&[]),
+         ipv6,
+         strict,
++        resolver,
+     )?;
+ 
+     let raw_groups = raw.proxy_groups.as_deref().unwrap_or(&[]);
+@@ -4499,15 +4515,18 @@
+             "tproxy",
+             ListenerSpec::TProxy {
+                 sni: global_tproxy_sni,
+-                // The shorthand keeps the managed-firewall default (issue
+-                // #563): external management is an explicit `listeners:`
+-                // opt-in only. UDP likewise stays opt-in (issue #564).
+-                firewall: true,
+-                udp: false,
++                // Android supervisors own true TCP/UDP TPROXY rules. Other
++                // platforms retain upstream's managed TCP-only shorthand.
++                firewall: !cfg!(target_os = "android"),
++                udp: cfg!(target_os = "android"),
+                 udp_timeout: default_udp_timeout_secs(),
+             },
+             port,
+-            "127.0.0.1",
++            if cfg!(target_os = "android") {
++                "::"
++            } else {
++                "127.0.0.1"
++            },
+             global_max_conns,
+         )?;
+     }
+@@ -4576,6 +4595,7 @@
+         // UDP TPROXY is IPv4-only in this release (issue #564): `::` is
+         // dual-stack on Linux and would silently accept v6 datagrams, so
+         // reject it rather than claim partial dual-stack support.
++        #[cfg(not(target_os = "android"))]
+         if let ListenerSpec::TProxy { udp: true, .. } = spec {
+             let v4 = listen
+                 .parse::<std::net::IpAddr>()
+@@ -4990,7 +5010,15 @@
+     async fn missing_plugin_node_binds_a_dead_placeholder() {
+         let mut proxies = HashMap::new();
+         let mut names = std::collections::HashSet::new();
+-        insert_parsed_leaves(&mut proxies, &mut names, &[raw_gost_node()], false, false).unwrap();
++        insert_parsed_leaves(
++            &mut proxies,
++            &mut names,
++            &[raw_gost_node()],
++            false,
++            false,
++            None,
++        )
++        .unwrap();
+         let bound = proxies
+             .get("s-gost")
+             .expect("a missing-plugin node must stay bound, not dropped");
+@@ -5004,8 +5032,15 @@
+     fn missing_plugin_node_still_hard_errors_under_strict() {
+         let mut proxies = HashMap::new();
+         let mut names = std::collections::HashSet::new();
+-        let err = insert_parsed_leaves(&mut proxies, &mut names, &[raw_gost_node()], false, true)
+-            .unwrap_err();
++        let err = insert_parsed_leaves(
++            &mut proxies,
++            &mut names,
++            &[raw_gost_node()],
++            false,
++            true,
++            None,
++        )
++        .unwrap_err();
+         assert!(
+             err.to_string().contains("strict mode"),
+             "strict must still hard-error: {err}"
+@@ -5182,6 +5217,7 @@
+             &[raw_direct_dup(), raw_dead_dup()],
+             false,
+             false,
++            None,
+         )
+         .unwrap();
+         assert_eq!(
+@@ -5204,6 +5240,7 @@
+             &[raw_dead_dup(), raw_direct_dup()],
+             false,
+             false,
++            None,
+         )
+         .unwrap();
+         assert_eq!(
+@@ -6054,7 +6091,7 @@
+         let mut names = std::collections::HashSet::new();
+ 
+         tracing::subscriber::with_default(subscriber, || {
+-            insert_parsed_leaves(&mut proxies, &mut names, &raws, false, false).unwrap();
++            insert_parsed_leaves(&mut proxies, &mut names, &raws, false, false, None).unwrap();
+         });
+ 
+         assert_eq!(proxies.len(), 1, "last-wins is unchanged");
+--- a/crates/meow-config/src/internal_http.rs
++++ b/crates/meow-config/src/internal_http.rs
+@@ -168,6 +168,35 @@
+     headers: &[(String, String)],
+ ) -> Result<Response> {
+     fetch_capped(url, proxy, headers, MAX_BODY_BYTES, false).await
++}
++
++/// Android primary subscription download: credentials stay scoped to the origin.
++pub async fn fetch_subscription(
++    url: &str,
++    proxy: Option<&Arc<dyn Proxy>>,
++    headers: &[(String, String)],
++) -> Result<Response> {
++    let mut current = Url::parse(url)?;
++    let mut headers = headers.to_vec();
++    for _ in 0..=10 {
++        match fetch_one(&current, proxy, &headers, MAX_BODY_BYTES).await? {
++            Outcome::Body(response) => return Ok(response),
++            Outcome::Redirect(next) => {
++                let next = current.join(&next)?;
++                if current.scheme() == "https" && next.scheme() != "https" {
++                    bail!("HTTPS subscription redirect downgrade is not allowed");
++                }
++                if current.origin() != next.origin() {
++                    headers.retain(|(name, _)| {
++                        !name.eq_ignore_ascii_case("x-hwid")
++                            && !name.eq_ignore_ascii_case("authorization")
++                    });
++                }
++                current = next;
++            }
++        }
++    }
++    bail!("too many subscription redirects")
+ }
+ 
+ /// [`fetch`] with an opt-in direct fallback, used only by the geodata
+@@ -459,6 +488,11 @@
+                 bail!("response exceeds max body size ({limit} bytes)");
+             }
+             buf.extend_from_slice(&tmp[..n]);
++            let mut fields = [httparse::EMPTY_HEADER; 64];
++            let mut response = httparse::Response::new(&mut fields);
++            if matches!(response.parse(&buf), Ok(httparse::Status::Complete(_))) {
++                check_hwid_headers(response.headers)?;
++            }
+         }
+         Result::<()>::Ok(())
+     };
+@@ -467,6 +501,22 @@
+         .map_err(|_| anyhow!("response read timed out after {READ_TIMEOUT:?}"))??;
+ 
+     parse_response(&buf, limit)
++}
++
++fn check_hwid_headers(headers: &[httparse::Header<'_>]) -> Result<()> {
++    let flag = |name: &str| {
++        headers.iter().any(|h| {
++            h.name.eq_ignore_ascii_case(name)
++                && std::str::from_utf8(h.value).is_ok_and(|v| v.trim().eq_ignore_ascii_case("true"))
++        })
++    };
++    if flag("x-hwid-max-devices-reached") || flag("x-hwid-limit") {
++        bail!("HWID_LIMIT_REACHED");
++    }
++    if flag("x-hwid-not-supported") {
++        bail!("HWID_NOT_SUPPORTED");
++    }
++    Ok(())
+ }
+ 
+ fn parse_response(buf: &[u8], limit: usize) -> Result<Outcome> {
+@@ -483,6 +533,7 @@
+         .code
+         .ok_or_else(|| anyhow!("response missing status code"))?;
+ 
++    check_hwid_headers(resp.headers)?;
+     if (300..400).contains(&status) {
+         for h in resp.headers.iter() {
+             if h.name.eq_ignore_ascii_case("location") {
+--- a/crates/meow-config/Cargo.toml
++++ b/crates/meow-config/Cargo.toml
+@@ -57,7 +57,7 @@
+ [dependencies]
+ meow-common = { workspace = true }
+ meow-trie = { workspace = true }
+-meow-dns = { workspace = true, features = ["encrypted"] }
++meow-dns = { workspace = true, features = ["encrypted", "dns-server"] }
+ meow-rules = { workspace = true }
+ meow-proxy = { workspace = true, default-features = false }
+ meow-transport = { workspace = true, features = ["tls", "ws", "grpc", "h2", "httpupgrade", "xhttp"] }
+--- /dev/null
++++ b/crates/meow-config/src/dns_outbound.rs
+@@ -0,0 +1,173 @@
++//! Android DNS outbound: wire-format queries share the tunnel's live resolver.
++use async_trait::async_trait;
++use meow_common::adapter::ProxyHealth;
++use meow_common::error::{MeowError, Result};
++use meow_common::{AdapterType, Metadata, ProxyAdapter, ProxyConn, ProxyPacketConn};
++use meow_dns::{DnsServer, ResolverSlot};
++use std::{
++    io,
++    net::SocketAddr,
++    pin::Pin,
++    task::{Context, Poll},
++    time::Duration,
++};
++use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
++use tokio::sync::{mpsc, watch, Mutex};
++
++pub async fn serve_tcp<S: AsyncRead + AsyncWrite + Unpin>(
++    mut stream: S,
++    slot: ResolverSlot,
++) -> io::Result<()> {
++    loop {
++        let work = async {
++            let size = stream.read_u16().await?;
++            let mut query = vec![0; usize::from(size)];
++            stream.read_exact(&mut query).await?;
++            let resolver = slot.read().clone();
++            let response = DnsServer::handle_query(&query, &resolver)
++                .await
++                .map_err(io::Error::other)?;
++            let size = u16::try_from(response.len()).map_err(io::Error::other)?;
++            stream.write_u16(size).await?;
++            stream.write_all(&response).await?;
++            stream.flush().await
++        };
++        tokio::time::timeout(Duration::from_secs(30), work).await??;
++    }
++}
++
++pub struct DnsAdapter {
++    name: String,
++    slot: Option<ResolverSlot>,
++    health: ProxyHealth,
++}
++impl DnsAdapter {
++    pub fn new(name: &str, slot: Option<ResolverSlot>) -> Self {
++        Self {
++            name: name.into(),
++            slot,
++            health: ProxyHealth::new(),
++        }
++    }
++    fn resolver(&self) -> Result<ResolverSlot> {
++        self.slot
++            .clone()
++            .ok_or_else(|| MeowError::Dns("DNS outbound cannot bootstrap its own resolver".into()))
++    }
++}
++#[async_trait]
++impl ProxyAdapter for DnsAdapter {
++    fn name(&self) -> &str {
++        &self.name
++    }
++    fn adapter_type(&self) -> AdapterType {
++        AdapterType::Dns
++    }
++    fn addr(&self) -> &str {
++        ""
++    }
++    fn support_udp(&self) -> bool {
++        true
++    }
++    fn health(&self) -> &ProxyHealth {
++        &self.health
++    }
++    async fn dial_tcp(&self, _: &Metadata) -> Result<Box<dyn ProxyConn>> {
++        let slot = self.resolver()?;
++        let (client, server) = tokio::io::duplex(65536);
++        let task = tokio::spawn(async move {
++            let _ = serve_tcp(server, slot).await;
++        });
++        Ok(Box::new(DnsStream {
++            stream: client,
++            task,
++        }))
++    }
++    async fn dial_udp(&self, _: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
++        let (tx, rx) = mpsc::channel(64);
++        let (closed, _) = watch::channel(false);
++        Ok(Box::new(DnsPacket {
++            slot: self.resolver()?,
++            tx,
++            rx: Mutex::new(rx),
++            closed,
++        }))
++    }
++}
++struct DnsStream {
++    stream: tokio::io::DuplexStream,
++    task: tokio::task::JoinHandle<()>,
++}
++impl Drop for DnsStream {
++    fn drop(&mut self) {
++        self.task.abort();
++    }
++}
++impl ProxyConn for DnsStream {}
++impl AsyncRead for DnsStream {
++    fn poll_read(
++        mut self: Pin<&mut Self>,
++        cx: &mut Context<'_>,
++        buf: &mut ReadBuf<'_>,
++    ) -> Poll<io::Result<()>> {
++        Pin::new(&mut self.stream).poll_read(cx, buf)
++    }
++}
++impl AsyncWrite for DnsStream {
++    fn poll_write(
++        mut self: Pin<&mut Self>,
++        cx: &mut Context<'_>,
++        buf: &[u8],
++    ) -> Poll<io::Result<usize>> {
++        Pin::new(&mut self.stream).poll_write(cx, buf)
++    }
++    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        Pin::new(&mut self.stream).poll_flush(cx)
++    }
++    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        Pin::new(&mut self.stream).poll_shutdown(cx)
++    }
++}
++struct DnsPacket {
++    slot: ResolverSlot,
++    tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
++    rx: Mutex<mpsc::Receiver<(Vec<u8>, SocketAddr)>>,
++    closed: watch::Sender<bool>,
++}
++#[async_trait]
++impl ProxyPacketConn for DnsPacket {
++    async fn read_packet(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
++        let mut closed = self.closed.subscribe();
++        let mut rx = self.rx.lock().await;
++        let packet = tokio::select! {
++            _ = closed.wait_for(|v| *v) => None,
++            value = rx.recv() => value,
++        }
++        .ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))?;
++        if packet.0.len() > buf.len() {
++            return Err(io::Error::from(io::ErrorKind::InvalidInput).into());
++        }
++        buf[..packet.0.len()].copy_from_slice(&packet.0);
++        Ok((packet.0.len(), packet.1))
++    }
++    async fn write_packet(&self, buf: &[u8], addr: &SocketAddr) -> Result<usize> {
++        let resolver = self.slot.read().clone();
++        let mut closed = self.closed.subscribe();
++        tokio::select! {
++            _ = closed.wait_for(|v| *v) => Err(io::Error::from(io::ErrorKind::BrokenPipe).into()),
++            result = async {
++                let response = tokio::time::timeout(Duration::from_secs(5), DnsServer::handle_query(buf, &resolver))
++                    .await.map_err(io::Error::other)?.map_err(io::Error::other)?;
++                self.tx.send((response, *addr)).await.map_err(io::Error::other)?;
++                Ok(buf.len())
++            } => result,
++        }
++    }
++    fn local_addr(&self) -> Result<SocketAddr> {
++        Ok(SocketAddr::from(([0, 0, 0, 0], 0)))
++    }
++    fn close(&self) -> Result<()> {
++        self.closed.send_replace(true);
++        Ok(())
++    }
++}
+--- a/crates/meow-common/src/adapter_type.rs
++++ b/crates/meow-common/src/adapter_type.rs
+@@ -3,6 +3,7 @@
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+ pub enum AdapterType {
++    Dns,
+     Direct,
+     Reject,
+     RejectDrop,
+@@ -36,6 +37,7 @@
+ impl fmt::Display for AdapterType {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         match self {
++            AdapterType::Dns => write!(f, "Dns"),
+             AdapterType::Direct => write!(f, "Direct"),
+             AdapterType::Reject => write!(f, "Reject"),
+             AdapterType::RejectDrop => write!(f, "RejectDrop"),
+--- a/crates/meow-common/src/process_lookup.rs
++++ b/crates/meow-common/src/process_lookup.rs
+@@ -20,6 +20,7 @@
+ /// the `platform` modules below when porting to a new OS.
+ pub const PROCESS_LOOKUP_SUPPORTED: bool = cfg!(any(
+     target_os = "linux",
++    target_os = "android",
+     target_os = "macos",
+     target_os = "windows"
+ ));
+@@ -58,7 +59,8 @@
+ /// there), or wherever an inbound supplies `uid`
+ /// ([`enable_inbound_process_info`]).
+ pub fn uid_info_available() -> bool {
+-    cfg!(target_os = "linux") || INBOUND_PROCESS_INFO.load(Ordering::Relaxed)
++    cfg!(any(target_os = "linux", target_os = "android"))
++        || INBOUND_PROCESS_INFO.load(Ordering::Relaxed)
+ }
+ 
+ #[derive(Debug, Clone, Default)]
+@@ -536,7 +538,16 @@
+     }
+ }
+ 
+-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
++#[cfg(target_os = "android")]
++#[path = "process_lookup_android.rs"]
++mod platform;
++
++#[cfg(not(any(
++    target_os = "linux",
++    target_os = "android",
++    target_os = "macos",
++    target_os = "windows"
++)))]
+ mod platform {
+     use super::{Network, ProcessInfo, SocketAddr};
+ 
+--- /dev/null
++++ b/crates/meow-common/src/process_lookup_android.rs
+@@ -0,0 +1,97 @@
++//! ROOT attribution without a JVM. VPN uses the inbound Android callbacks.
++use super::{Network, ProcessInfo, SocketAddr};
++use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
++
++pub fn find_process(network: Network, local: SocketAddr) -> Option<ProcessInfo> {
++    if unsafe { libc::geteuid() } != 0 {
++        return None;
++    }
++    let protocol = match network {
++        Network::Tcp => "tcp",
++        Network::Udp => "udp",
++    };
++    let uid = [
++        format!("/proc/net/{protocol}6"),
++        format!("/proc/net/{protocol}"),
++    ]
++    .iter()
++    .filter_map(|path| std::fs::read_to_string(path).ok())
++    .find_map(|table| socket_uid(&table, local))?;
++    let packages = std::fs::read_to_string("/data/system/packages.list").unwrap_or_default();
++    let name = packages
++        .lines()
++        .find_map(|line| {
++            let mut fields = line.split_whitespace();
++            let package = fields.next()?;
++            let app_id = fields.next()?.parse::<u32>().ok()?;
++            (app_id == uid % 100000).then(|| package.to_owned())
++        })
++        .unwrap_or_default();
++    Some(ProcessInfo {
++        name,
++        path: String::new(),
++        uid: Some(uid),
++    })
++}
++
++fn socket_uid(table: &str, local: SocketAddr) -> Option<u32> {
++    let mut wildcard = None;
++    for line in table.lines().skip(1) {
++        let fields: Vec<_> = line.split_whitespace().collect();
++        if fields.len() < 8 {
++            continue;
++        }
++        let Some((ip, port)) = fields[1].split_once(':') else {
++            continue;
++        };
++        if u16::from_str_radix(port, 16).ok() != Some(local.port()) {
++            continue;
++        }
++        let Some(ip) = proc_ip(ip) else {
++            continue;
++        };
++        let Some(uid) = fields[7].parse().ok() else {
++            continue;
++        };
++        if ip.to_canonical() == local.ip().to_canonical() {
++            return Some(uid);
++        }
++        if ip.is_unspecified() {
++            wildcard = Some(uid);
++        }
++    }
++    wildcard
++}
++
++fn proc_ip(raw: &str) -> Option<IpAddr> {
++    let mut bytes = Vec::new();
++    for chunk in raw.as_bytes().chunks_exact(8) {
++        let word = u32::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
++        bytes.extend_from_slice(&word.to_ne_bytes());
++    }
++    match raw.len() {
++        8 => Some(Ipv4Addr::from(<[u8; 4]>::try_from(bytes).ok()?).into()),
++        32 => Some(Ipv6Addr::from(<[u8; 16]>::try_from(bytes).ok()?).into()),
++        _ => None,
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn android_uid_from_proc_tables() {
++        let table = "header\n0: 0100007F:1234 00000000:0000 01 0:0 0:0 0 10123 0 1";
++        assert_eq!(
++            socket_uid(table, "127.0.0.1:4660".parse().unwrap()),
++            Some(10123)
++        );
++        assert_eq!(socket_uid(table, "127.0.0.1:4661".parse().unwrap()), None);
++        assert_eq!(
++            proc_ip("0000000000000000FFFF00000100007F")
++                .unwrap()
++                .to_canonical(),
++            "127.0.0.1".parse::<IpAddr>().unwrap()
++        );
++    }
++}

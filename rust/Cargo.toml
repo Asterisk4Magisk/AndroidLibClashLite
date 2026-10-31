@@ -1,0 +1,57 @@
+[package]
+name = "libclash-rs"
+version = "0.28.0-android.1"
+edition = "2021"
+rust-version = "1.89"
+license = "LGPL-3.0-only"
+
+[lib]
+name = "rsjni"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+meow-common = { path = ".upstream/meow/crates/meow-common", features = ["logbook"] }
+meow-config = { path = ".upstream/meow/crates/meow-config", features = ["ss", "trojan", "vless", "vless-vision", "vless-encryption", "vmess", "snell", "hysteria2", "anytls", "ech-tls-tunnel", "mux", "kcptun"] }
+meow-dns = { path = ".upstream/meow/crates/meow-dns", features = ["dns-server", "encrypted"] }
+meow-api = { path = ".upstream/meow/crates/meow-api" }
+meow-tunnel = { path = ".upstream/meow/crates/meow-tunnel" }
+meow-proxy = { path = ".upstream/meow/crates/meow-proxy" }
+meow-listener = { path = ".upstream/meow/crates/meow-listener", features = ["listener-mixed", "listener-http", "listener-socks5"] }
+lwip = { package = "meow-lwip", path = ".upstream/meow/crates/meow-lwip" }
+anyhow = "1"
+base64 = "0.22"
+fancy-regex = "0.16"
+axum = { version = "0.8", features = ["ws"] }
+dashmap = "6"
+futures = "0.3"
+jni = "0.21"
+libc = "0.2"
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+subtle = "2"
+tempfile = "3"
+time = { version = "0.3", features = ["parsing"] }
+tokio = { version = "1.54", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+age = { version = "0.11.3", default-features = false, features = ["armor"] }
+url = "2"
+md-5 = "0.10"
+percent-encoding = "2"
+
+[dev-dependencies]
+async-trait = "0.1"
+
+[build-dependencies]
+serde_json = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+panic = "unwind"
+

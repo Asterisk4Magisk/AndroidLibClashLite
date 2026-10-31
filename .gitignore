@@ -3,4 +3,7 @@
 build/
 *.aar
 libclash-sources.jar
+libclash-rs-sources.jar
+rust/target/
+rust/.upstream/
 __pycache__/
