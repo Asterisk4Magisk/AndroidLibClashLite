@@ -22,7 +22,6 @@ import (
 	A "github.com/metacubex/mihomo/adapter/outbound"
 	"github.com/metacubex/mihomo/adapter/provider"
 	"github.com/metacubex/mihomo/component/dialer"
-	"github.com/metacubex/mihomo/component/profile/cachefile"
 	"github.com/metacubex/mihomo/component/proxydialer"
 	C "github.com/metacubex/mihomo/constant"
 	RB "github.com/metacubex/mihomo/rules/bundle"
@@ -122,22 +121,6 @@ func fetch(ctx context.Context, url *U.URL, file string, userAgent string, hwid 
 		return header, ctxErr
 	}
 	return header, err
-}
-
-func fetchProvider(
-	prefix string,
-	name string,
-	download func() (fetchHeader, error),
-	store func(string, string),
-) error {
-	header, err := download()
-	if err != nil {
-		return err
-	}
-	if prefix == PROXIES && header.SubscriptionUserInfo != "" {
-		store(name, header.SubscriptionUserInfo)
-	}
-	return nil
 }
 
 func writeFile(file string, reader io.Reader) error {
@@ -338,16 +321,7 @@ func FetchAndValid(
 
 		// Match CMFA: provider prefetch is best-effort. Keep validating the
 		// configuration; Mihomo initializes and updates providers at runtime.
-		_ = fetchProvider(
-			prefix,
-			name,
-			func() (fetchHeader, error) {
-				return fetch(ctx, url, ps, defaultUserAgent, "", requestDialer)
-			},
-			func(name string, value string) {
-				cachefile.Cache().SetSubscriptionInfo(name, value)
-			},
-		)
+		_, _ = fetch(ctx, url, ps, defaultUserAgent, "", requestDialer)
 	})
 	if err := ctx.Err(); err != nil {
 		return err
@@ -362,6 +336,9 @@ func FetchAndValid(
 
 	reportStatus(string(statusBytes))
 
+	// Validation creates a temporary DNS pool and never applies it. Keep that
+	// pool in memory so parsing cannot acquire the active runtime's cache.db.
+	rawCfg.Profile.StoreFakeIP = false
 	cfg, err := Parse(rawCfg)
 	if err != nil {
 		return err

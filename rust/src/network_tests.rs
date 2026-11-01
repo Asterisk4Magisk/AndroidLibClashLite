@@ -300,7 +300,7 @@ fn android_root_uid_lookup_and_tproxy_default() {
             .unwrap();
     assert_eq!(owner.uid, Some(unsafe { libc::geteuid() }));
     assert!(process_lookup::uid_info_available());
-    let (raw, _) =
+    let (raw, _, _) =
         crate::engine::parse(b"listeners: [{name: tp, type: tproxy, port: 18081, udp: true}]")
             .unwrap();
     let named = meow_config::resolve_named_listeners(&raw).unwrap();

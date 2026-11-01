@@ -41,6 +41,22 @@ pub fn decode(bytes: &[u8]) -> Result<Value> {
     Ok(value)
 }
 
+/// The Unix controller belongs to the Android binding, not meow's raw config.
+pub fn decode_core(bytes: &[u8]) -> Result<(Value, Option<String>)> {
+    let mut value = decode(bytes)?;
+    let socket = value
+        .as_mapping_mut()
+        .unwrap()
+        .remove(Value::from("external-controller-unix"));
+    let socket = match socket {
+        None | Some(Value::Null) => None,
+        Some(Value::String(path)) if path.is_empty() => None,
+        Some(Value::String(path)) => Some(path),
+        _ => anyhow::bail!("external-controller-unix must be a path string"),
+    };
+    Ok((value, socket))
+}
+
 pub fn decode_with_diagnostics(
     bytes: &[u8],
 ) -> Result<(Value, Vec<crate::compatibility::Diagnostic>)> {

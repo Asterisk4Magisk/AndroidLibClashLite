@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	"cfa/native/config"
+	_ "cfa/native/config/api"
 )
 
 // Completion receives an empty errorText on success, otherwise an error message.

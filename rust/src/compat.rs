@@ -157,7 +157,7 @@ async fn fetch(args: &Value) -> Result<Value> {
     Ok(json!({"body":STANDARD.encode(&response.body), "headers":headers}))
 }
 
-fn resident_memory() -> u64 {
+pub(crate) fn resident_memory() -> u64 {
     std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|s| {

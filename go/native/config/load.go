@@ -4,8 +4,10 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	P "path"
+	"path/filepath"
 	"runtime"
 	"strings"
 
@@ -14,6 +16,7 @@ import (
 	"github.com/metacubex/mihomo/common/yaml"
 	"github.com/metacubex/mihomo/config"
 	"github.com/metacubex/mihomo/hub"
+	"github.com/metacubex/mihomo/hub/executor"
 	"github.com/metacubex/mihomo/log"
 )
 
@@ -66,17 +69,38 @@ func Parse(rawConfig *config.RawConfig) (*config.Config, error) {
 
 func Load(path string) error {
 	rawCfg, err := UnmarshalAndPatch(path)
-	return applyProfile(path, rawCfg, err)
+	return applyProfile(path, rawCfg, err, hub.ApplyConfig)
 }
 
 // LoadBytes keeps standby configuration in memory without replacing the service's config.yaml.
 // path remains the provider base directory, just as it is for Load.
 func LoadBytes(path string, content []byte) error {
 	rawCfg, err := UnmarshalAndPatchBytes(path, content)
-	return applyProfile(path, rawCfg, err)
+	return applyProfile(path, rawCfg, err, hub.ApplyConfig)
 }
 
-func applyProfile(path string, rawCfg *config.RawConfig, err error) error {
+// Reload applies an HTTP configuration update through the same preparation as
+// JNI Load, retaining the running controller and the separately owned VPN TUN.
+// A nil content reads path; otherwise path supplies the provider base directory.
+func Reload(path string, content []byte, force bool) error {
+	if content == nil {
+		var err error
+		content, err = os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if len(content) == 0 {
+			return fmt.Errorf("configuration file %s is empty", path)
+		}
+	}
+	profileDir := filepath.Dir(path)
+	rawCfg, err := UnmarshalAndPatchBytes(profileDir, content)
+	return applyProfile(profileDir, rawCfg, err, func(cfg *config.Config) {
+		executor.ApplyConfig(cfg, force)
+	})
+}
+
+func applyProfile(path string, rawCfg *config.RawConfig, err error, apply func(*config.Config)) error {
 	if err != nil {
 		log.Errorln("Load %s: %s", path, err.Error())
 
@@ -92,8 +116,7 @@ func applyProfile(path string, rawCfg *config.RawConfig, err error) error {
 		return err
 	}
 
-	// like hub.Parse()
-	hub.ApplyConfig(cfg)
+	apply(cfg)
 
 	app.ApplySubtitlePattern(rawCfg.ClashForAndroid.UiSubtitlePattern)
 

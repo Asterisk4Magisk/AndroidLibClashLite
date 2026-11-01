@@ -6,7 +6,7 @@ use crate::autoswitch::{Service, Settings};
 use anyhow::{Context, Result};
 use axum::{
     body::{to_bytes, Body},
-    extract::{Request, State},
+    extract::{MatchedPath, Request, State},
     http::{Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -22,9 +22,14 @@ struct Extension {
     app: Arc<AppState>,
     autoswitch: Arc<Service>,
     startup: Arc<meow_config::raw::RawConfig>,
+    controller_unix: Option<String>,
 }
 
-pub fn router(app: Arc<AppState>, autoswitch: Arc<Service>) -> Router {
+pub fn router(
+    app: Arc<AppState>,
+    autoswitch: Arc<Service>,
+    controller_unix: Option<String>,
+) -> Router {
     let startup = Arc::new(app.raw_config.read().clone());
     meow_api::routes::create_router(app.clone())
         .layer(middleware::from_fn_with_state(
@@ -32,6 +37,7 @@ pub fn router(app: Arc<AppState>, autoswitch: Arc<Service>) -> Router {
                 app,
                 autoswitch,
                 startup,
+                controller_unix,
             },
             extend,
         ))
@@ -102,12 +108,46 @@ async fn extend(State(extension): State<Extension>, mut request: Request, next: 
     let capabilities = path == "/asterisk/capabilities";
     let reload = path == "/configs" && method == Method::PUT;
     let save = path == "/api/config/save" && method == Method::POST;
-    if (custom || capabilities || reload || save) && !authorized(&request, &extension.app) {
+    let memory =
+        path == "/memory" && method == Method::GET && !request.headers().contains_key("upgrade");
+    if (custom || capabilities || reload || save || memory) && !authorized(&request, &extension.app)
+    {
         return error(StatusCode::UNAUTHORIZED, "Unauthorized");
     }
-    // All mutable API operations share the automatic selection lane. Reads,
-    // probes and streaming endpoints remain independent of a slow reload.
-    let _mutation = if method != Method::GET && method != Method::HEAD && method != Method::OPTIONS
+    if memory {
+        // Upstream's process-global feed can outlive this binding's disposable
+        // runtime. Tie HTTP sampling to the response and use the bridge's RSS metric.
+        let stream = futures::stream::unfold(
+            tokio::time::interval(std::time::Duration::from_secs(1)),
+            |mut interval| async move {
+                interval.tick().await;
+                let sample =
+                    serde_json::json!({"inuse": crate::compat::resident_memory(), "oslimit": 0});
+                Some((
+                    Ok::<_, std::convert::Infallible>(format!("{sample}\n")),
+                    interval,
+                ))
+            },
+        );
+        return Response::builder()
+            .header("content-type", "application/json")
+            .body(Body::from_stream(stream))
+            .expect("valid memory stream response");
+    }
+    // Provider refresh uses the same synchronization as background refresh.
+    // Other API mutations remain coordinated with automatic selection.
+    let provider_refresh = method == Method::PUT
+        && matches!(
+            request
+                .extensions()
+                .get::<MatchedPath>()
+                .map(MatchedPath::as_str),
+            Some("/providers/proxies/{name}" | "/providers/rules/{name}")
+        );
+    let _mutation = if !provider_refresh
+        && method != Method::GET
+        && method != Method::HEAD
+        && method != Method::OPTIONS
     {
         Some(extension.autoswitch.mutations.lock().await)
     } else {
@@ -170,10 +210,23 @@ async fn extend(State(extension): State<Extension>, mut request: Request, next: 
                         .context("path or payload required")?,
                 )?
             };
-            let (raw, settings) = crate::engine::parse(&bytes)?;
-            let restart = restart_fields(&extension.startup, &raw)?;
+            let (mut value, controller_unix) = crate::profile::decode_core(&bytes)?;
+            // JNI starts prepared profiles without a config path. Keep its
+            // disabled TCP controller disabled when reloading the app's source file.
+            // CLI/ROOT sessions supply a path and retain controller restart checks.
+            if extension.app.config_path.is_none()
+                && extension.startup.external_controller.is_none()
+            {
+                value["external-controller"] = serde_yaml::Value::Null;
+                value["external-controller-tls"] = serde_yaml::Value::Null;
+            }
+            let normalized = serde_yaml::to_string(&value)?;
+            let (raw, settings, _) = crate::engine::parse(normalized.as_bytes())?;
+            let mut restart = restart_fields(&extension.startup, &raw)?;
+            if extension.controller_unix != controller_unix {
+                restart.push("external-controller-unix");
+            }
             // Pass the exact bytes checked here; a file can change during reload.
-            let normalized = serde_yaml::to_string(&crate::profile::decode(&bytes)?)?;
             let payload = serde_json::json!({"payload": STANDARD.encode(normalized)}).to_string();
             Ok::<_, anyhow::Error>((payload, settings, restart))
         }
@@ -214,6 +267,9 @@ async fn save_config(extension: &Extension) -> Result<()> {
     let _mutation = meow_api::routes::CONFIG_MUTATION.lock().await;
     let configured = extension.autoswitch.configured().await;
     let mut value = serde_yaml::to_value(&*extension.app.raw_config.read())?;
+    if let Some(path) = &extension.controller_unix {
+        value["external-controller-unix"] = path.clone().into();
+    }
     value.as_mapping_mut().context("config mapping")?.insert(
         "asterisk-auto-switch".into(),
         serde_yaml::to_value(configured)?,

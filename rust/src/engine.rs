@@ -27,6 +27,42 @@ struct Session {
     autoswitch: Arc<crate::autoswitch::Service>,
     home: String,
     base: String,
+    unix_controller: Option<UnixController>,
+}
+
+struct UnixController {
+    path: String,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for UnixController {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(unix)]
+impl UnixController {
+    fn bind(path: String, router: Router) -> Result<Self> {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("remove stale Unix controller"),
+        }
+        let socket = tokio::net::UnixListener::bind(&path).context("bind Unix controller")?;
+        let mut controller = Self { path, task: None };
+        std::fs::set_permissions(&controller.path, std::fs::Permissions::from_mode(0o600))?;
+        controller.task = Some(tokio::spawn(async move {
+            if let Err(error) = axum::serve(socket, router).await {
+                tracing::error!("Unix Clash API stopped: {error}");
+            }
+        }));
+        Ok(controller)
+    }
 }
 
 pub fn tunnel() -> Option<Tunnel> {
@@ -61,9 +97,11 @@ fn check_config(raw: &RawConfig) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn parse(bytes: &[u8]) -> Result<(RawConfig, crate::autoswitch::Settings)> {
+pub(crate) fn parse(
+    bytes: &[u8],
+) -> Result<(RawConfig, crate::autoswitch::Settings, Option<String>)> {
     meow_common::process_lookup::enable_inbound_process_info();
-    let value = crate::profile::decode(bytes)?;
+    let (value, controller_unix) = crate::profile::decode_core(bytes)?;
     let raw = meow_config::parse_raw_yaml(&serde_yaml::to_string(&value)?)
         .context("parse configuration")?;
     let settings = value
@@ -74,7 +112,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<(RawConfig, crate::autoswitch::Setti
         .transpose()?
         .unwrap_or_default();
     check_config(&raw)?;
-    Ok((raw, settings))
+    Ok((raw, settings, controller_unix))
 }
 
 pub fn start(home: &str, base: &str, bytes: &[u8], config_path: Option<String>) -> Result<()> {
@@ -94,7 +132,7 @@ fn start_inner(
     if !Path::new(home).is_absolute() || !Path::new(base).is_absolute() {
         bail!("home and baseDirectory must be absolute paths");
     }
-    let (raw, settings) = parse(bytes)?;
+    let (raw, settings, controller_unix) = parse(bytes)?;
     std::fs::create_dir_all(home)?;
     meow_common::set_home_dir(PathBuf::from(home));
     meow_config::set_offline_validate(false);
@@ -103,7 +141,8 @@ fn start_inner(
     let result = crate::get_runtime().block_on(async {
         let config = meow_config::build_config(raw, Some(Path::new(base))).await?;
         meow_api::ensure_listeners_supported(&config.listeners.named, crate::listeners::supported)?;
-        let mut session = start_config(config, config_path, settings, reload_state).await?;
+        let mut session =
+            start_config(config, config_path, settings, reload_state, controller_unix).await?;
         session.home = home.into();
         session.base = base.into();
         *SESSION.lock() = Some(session);
@@ -120,6 +159,7 @@ async fn start_config(
     config_path: Option<String>,
     settings: crate::autoswitch::Settings,
     reload_state: Option<crate::autoswitch::ReloadState>,
+    controller_unix: Option<String>,
 ) -> Result<Session> {
     meow_common::set_host_resolver(Arc::new(
         meow_dns::ResolverHostHook::new_with_proxy_resolver(
@@ -194,7 +234,25 @@ async fn start_config(
         dns_server: dns_handle,
     });
     let autoswitch = crate::autoswitch::Service::new(app.tunnel.clone());
-    let router = crate::control::router(Arc::clone(&app), autoswitch.clone());
+    let router = crate::control::router(
+        Arc::clone(&app),
+        autoswitch.clone(),
+        controller_unix.clone(),
+    );
+    let unix_controller = match controller_unix {
+        Some(path) => {
+            #[cfg(unix)]
+            {
+                Some(UnixController::bind(path, router.clone())?)
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = path;
+                bail!("Unix controllers are unavailable on this platform");
+            }
+        }
+        None => None,
+    };
     if let Some(address) = address {
         let socket = tokio::net::TcpListener::bind(address).await?;
         let service = router.clone();
@@ -215,6 +273,7 @@ async fn start_config(
         autoswitch,
         home: String::new(),
         base: String::new(),
+        unix_controller,
     })
 }
 
@@ -232,6 +291,9 @@ pub fn reload(
         .as_ref()
         .map(|session| -> Result<_> {
             let mut raw = serde_yaml::to_value(&*session.app.raw_config.read())?;
+            if let Some(controller) = &session.unix_controller {
+                raw["external-controller-unix"] = controller.path.clone().into();
+            }
             raw["asterisk-auto-switch"] = serde_yaml::to_value(
                 crate::get_runtime().block_on(session.autoswitch.configured()),
             )?;
@@ -360,7 +422,7 @@ pub fn validate(home: &str, base: &str, bytes: &[u8]) -> Result<()> {
     if !Path::new(home).is_absolute() || !Path::new(base).is_absolute() {
         bail!("home and baseDirectory must be absolute paths");
     }
-    let (raw, _) = parse(bytes)?;
+    let (raw, _, _) = parse(bytes)?;
     meow_common::set_home_dir(PathBuf::from(home));
     meow_config::set_offline_validate(true);
     let result = crate::get_runtime().block_on(async {
