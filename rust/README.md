@@ -1,8 +1,8 @@
-# meow / Rust
+# Meow / Rust
 
 [Project overview](../README.md) · [Mihomo / Go](../go/README.md)
 
-The meow revision is pinned in [upstream.json](upstream.json), dependencies in
+The Meow revision is pinned in [upstream.json](upstream.json), dependencies in
 [Cargo.lock](Cargo.lock), and the toolchain in [rust-toolchain.toml](rust-toolchain.toml).
 This directory contains the JNI/CLI adapters, native launcher and
 [Android patches](patches/README.md). Java builds use `android/libclash` and
@@ -40,7 +40,7 @@ supports offline preparation. Do not edit Cargo's shared dependency cache.
 
 | Native file per ABI | Role |
 | --- | --- |
-| `librsjni.so` | meow core and JNI bindings |
+| `librsjni.so` | Meow core and JNI bindings |
 | `libmeow.so` | Standalone launcher that loads the sibling `librsjni.so` |
 
 ## Standalone CLI
@@ -79,7 +79,7 @@ starting the ROOT system-DNS observer.
 The facade dispatches finite Clash API requests in-process; no loopback
 controller is required. Explicit `external-controller` overrides can still
 serve the upstream API. Resource loading, providers, probes and routing reuse
-meow implementations.
+Meow implementations.
 
 ## Compatibility facade
 
@@ -167,7 +167,7 @@ the Go implementation returns `[]` for a parseable Go profile. Rust reports and
 ignores known unsupported DNS options (`direct-nameserver`,
 `direct-nameserver-follow-policy`, `respect-rules`, `prefer-h3`), geodata selection
 options, `unified-delay`, `tcp-concurrent` and unsupported TUN tuning fields.
-These options cannot block startup and do not change existing meow behavior.
+These options cannot block startup and do not change existing Meow behavior.
 Diagnostics omit option values, subscription URLs and credentials. Startup/load
 also logs these warnings, so existing callers need no diagnostic integration.
 Unsupported nodes/rules follow upstream's policy, including unavailable proxy
@@ -215,7 +215,7 @@ listeners:
 before reporting success; stop releases both. Linux/macOS upstream defaults
 remain unchanged. Android TCP uses the original destination on the accepted
 transparent socket; it requires TPROXY rules, not TCP REDIRECT rules.
-UDP routing and session handling reuse meow. Existing META rules can route
+UDP routing and session handling reuse Meow. Existing META rules can route
 port 53 to `{name: dns-out, type: dns}`; TCP and UDP queries use the tunnel's
 live resolver, including Fake-IP and resolver changes after config reload.
 For Android named TPROXY listeners, omitted `firewall` defaults to `false`;
@@ -224,9 +224,9 @@ The upstream UDP path excludes destinations whose port equals the listener port.
 
 ## System DNS
 
-Use `system` or `system://` wherever meow accepts DNS upstreams, including
+Use `system` or `system://` wherever Meow accepts DNS upstreams, including
 `nameserver`, `default-nameserver`, `proxy-server-nameserver` and
-`nameserver-policy`. `direct-nameserver` is not implemented by pinned meow;
+`nameserver-policy`. `direct-nameserver` is not implemented by pinned Meow;
 DIRECT continues to use its normal resolver.
 
 For JNI, call `notifyDnsChanged` with the underlying physical network's complete
@@ -247,7 +247,7 @@ Helper failure stops the CLI with status 70; CLI exit also stops its helper.
 It uses the [same settings and state schema](../go/README.md#auto-switch), including preferred
 tiers, consecutive failures, 1/2/4/8-round scan backoff, expected-delay early
 acceptance, manual-selection precedence and three-success restoration. It reuses
-meow's probes, live provider members, Selector API and selection persistence.
+Meow's probes, live provider members, Selector API and selection persistence.
 
 Use `Libclash.queryAutoSwitch()` / `patchAutoSwitch(settingsJSON)`, or the
 authenticated `GET/PATCH /asterisk/auto-switch` routes. Control overrides survive
@@ -261,12 +261,12 @@ with bounded backtracking; it is not the full .NET/regexp2 engine. Invalid API
 patterns return 400. Status ranges accept Mihomo's slash/comma separators and
 `*`; an empty range accepts any status, matching the Go binding.
 
-The `inUse` optimization uses meow's tracked TCP connections and upstream's
+The `inUse` optimization uses Meow's tracked TCP connections and upstream's
 second-resolution start timestamps. UDP-only activity
-still uses a health probe because meow exposes no per-flow UDP receive history.
+still uses a health probe because Meow exposes no per-flow UDP receive history.
 Switches close affected TCP connections and UDP NAT sessions; a load-balance
 ancestor's UDP sessions are refreshed together because their exact member chains
-are not exposed by meow.
+are not exposed by Meow.
 
 ## Tests
 
@@ -305,12 +305,12 @@ These tests do not establish compatibility with a particular handset's ROOT poli
 
 ## Upstream updates
 
-The shared updater resolves each stable meow tag to its commit, updates
+The shared updater resolves each stable Meow tag to its commit, updates
 `rust/upstream.json`, applies the existing Android patches, and synchronizes the
 crate version, MSRV and pinned Rust toolchain. Runtime version reporting and
 build metadata read `upstream.json` directly.
 
-After applying a meow update, refresh the lockfile and validate it:
+After applying a Meow update, refresh the lockfile and validate it:
 
 ```sh
 cd rust

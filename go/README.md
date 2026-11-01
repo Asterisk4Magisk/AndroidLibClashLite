@@ -1,6 +1,6 @@
 # Mihomo / Go
 
-[Project overview](../README.md) · [meow / Rust](../rust/README.md)
+[Project overview](../README.md) · [Meow / Rust](../rust/README.md)
 
 Mihomo is pinned in [go.mod](go.mod). This directory contains the `libclash*.go`
 API, Android runtime environment, native adapters and Mihomo source overlays.
