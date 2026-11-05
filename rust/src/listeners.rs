@@ -33,6 +33,7 @@ pub async fn start(
     tunnel: &Tunnel,
     sniffer: &Arc<SnifferRuntime>,
     auth: &Arc<meow_common::AuthConfig>,
+    keepalive: meow_common::TcpKeepaliveConfig,
 ) -> Result<()> {
     let ip: IpAddr = match listener.listen.as_str() {
         "*" | "" => "0.0.0.0".parse().unwrap(),
@@ -66,6 +67,7 @@ pub async fn start(
             )
             .with_sniffer(sniffer.clone())
             .with_max_connections(listener.max_connections)
+            .with_tcp_keepalive(keepalive)
             .with_firewall(false)
             .with_udp(*udp, std::time::Duration::from_secs(*udp_timeout))
             .prepare(bound)
@@ -85,6 +87,7 @@ pub async fn start(
     let server = MixedListener::new(tunnel.clone(), bound, listener.name.clone())
         .with_sniffer(sniffer.clone())
         .with_auth(auth.clone())
+        .with_tcp_keepalive(keepalive)
         .with_max_connections(listener.max_connections);
     tokio::spawn(async move {
         if let Err(e) = server.run_on(socket).await {

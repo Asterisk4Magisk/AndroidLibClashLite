@@ -293,6 +293,10 @@ fn api_reload_requires_restart_without_partial_changes() {
         config(0),
         format!("{original}authentication: ['user:password']\n"),
         format!("{original}secret: next\n"),
+        format!("{original}tcp-keepalive: false\n"),
+        format!("{original}tcp-keepalive-idle: 120\n"),
+        format!("{original}tcp-keepalive-interval: 10\n"),
+        format!("{original}tcp-keepalive-probes: 3\n"),
     ] {
         let body = serde_json::json!({"payload": STANDARD.encode(change.replace("mode: rule", "mode: global"))}).to_string();
         for route in ["/configs", "/configs?force=true"] {
@@ -310,6 +314,29 @@ fn api_reload_requires_restart_without_partial_changes() {
     }
     let body = serde_json::json!({"payload": STANDARD.encode(original.replace("mode: rule", "mode: direct"))}).to_string();
     assert_eq!(api("PUT", "/configs", &body)["status"], 204);
+}
+
+#[test]
+fn tcp_idle_timeout_applies_on_startup_and_hot_reload() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let _operation = engine::OPERATION.lock();
+    let path = directory();
+    let _cleanup = Cleanup(path.clone());
+    let home = path.to_str().unwrap();
+    let profile = format!("{}tcp-keepalive: false\ntcp-idle-timeout: 3\n", config(0));
+    engine::start(home, home, profile.as_bytes(), None).unwrap();
+    let tunnel = engine::tunnel().unwrap();
+    assert_eq!(
+        tunnel.inner().tcp_idle_timeout(),
+        Some(Duration::from_secs(3))
+    );
+    let updated = profile.replace("tcp-idle-timeout: 3", "tcp-idle-timeout: 8");
+    let body = serde_json::json!({"payload": STANDARD.encode(updated)}).to_string();
+    assert_eq!(api("PUT", "/configs", &body)["status"], 204);
+    assert_eq!(
+        tunnel.inner().tcp_idle_timeout(),
+        Some(Duration::from_secs(8))
+    );
 }
 
 #[test]
@@ -353,11 +380,11 @@ fn ignored_core_options_do_not_block_startup() {
     let path = directory();
     let _cleanup = Cleanup(path.clone());
     let home = path.to_str().unwrap();
-    let yaml = b"rules: ['MATCH,DIRECT']\ngeodata-mode: true\ngeodata-loader: memconservative\ngeoip-matcher: succinct\nunified-delay: true\ndns: {enable: true, nameserver: ['system://'], direct-nameserver: ['https://private.test/dns'], respect-rules: true, prefer-h3: true}\ntun: {enable: false, stack: mips}\nclash-for-android: {ui-subtitle-pattern: '('}\n";
+    let yaml = b"rules: ['MATCH,DIRECT']\ngeodata-mode: true\ngeodata-loader: memconservative\ngeoip-matcher: succinct\nunified-delay: true\ndns: {enable: true, nameserver: ['system://'], respect-rules: true, prefer-h3: true}\ntun: {enable: false, stack: private-stack}\nclash-for-android: {ui-subtitle-pattern: '('}\n";
     let (_, diagnostics) = crate::profile::decode_with_diagnostics(yaml).unwrap();
     let report = serde_json::to_value(diagnostics).unwrap();
-    assert_eq!(report.as_array().unwrap().len(), 9);
-    assert!(!report.to_string().contains("private.test"));
+    assert_eq!(report.as_array().unwrap().len(), 8);
+    assert!(!report.to_string().contains("private-stack"));
     engine::validate(home, home, yaml).unwrap();
     engine::start(home, home, yaml, None).unwrap();
     assert_eq!(api("GET", "/version", "")["status"], 200);

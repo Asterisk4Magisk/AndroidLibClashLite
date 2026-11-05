@@ -19,6 +19,10 @@ struct DnsPeer {
 }
 impl DnsPeer {
     fn new(bind: &str, last_octet: u8) -> Self {
+        Self::with_answer(bind, [192, 0, 2, last_octet])
+    }
+
+    fn with_answer(bind: &str, answer: [u8; 4]) -> Self {
         let socket = UdpSocket::bind(bind).unwrap();
         socket
             .set_read_timeout(Some(Duration::from_millis(100)))
@@ -43,9 +47,8 @@ impl DnsPeer {
                     reply[2..4].copy_from_slice(&[0x81, 0x80]);
                     reply[6..12].copy_from_slice(&[0, u8::from(is_a), 0, 0, 0, 0]);
                     if is_a {
-                        reply.extend_from_slice(&[
-                            0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, last_octet,
-                        ]);
+                        reply.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+                        reply.extend_from_slice(&answer);
                     }
                     socket.send_to(&reply, from).unwrap();
                 }
@@ -70,6 +73,77 @@ fn dns_query() -> Vec<u8> {
     let mut bytes = vec![0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
     bytes.extend_from_slice(b"\x06lookup\x04test\0\0\x01\0\x01");
     bytes
+}
+
+#[test]
+fn direct_nameserver_and_policy_survive_binding_normalization_and_reload() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let _operation = crate::engine::OPERATION.lock();
+    let main = DnsPeer::new("127.0.0.1:0", 31);
+    let direct = DnsPeer::with_answer("127.0.0.1:0", [127, 0, 0, 1]);
+    let policy = DnsPeer::with_answer("127.0.0.1:0", [127, 0, 0, 1]);
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().to_str().unwrap();
+    let profile = format!(
+        "log-level: silent\nlogbook: {{enable: false}}\ndns:\n  enable: true\n  nameserver: ['udp://{}']\n  direct-nameserver: ['udp://{}']\n  direct-nameserver-follow-policy: false\n  nameserver-policy: {{'lookup.test': 'udp://{}'}}\nrules: ['MATCH,DIRECT']\n",
+        main.address, direct.address, policy.address
+    );
+    let capabilities: serde_json::Value =
+        serde_json::from_str(&crate::engine::capabilities()).unwrap();
+    assert_eq!(capabilities["dnsOptions"]["direct-nameserver"], true);
+    assert_eq!(
+        capabilities["dnsOptions"]["direct-nameserver-follow-policy"],
+        true
+    );
+    crate::engine::start(home, home, profile.as_bytes(), None).unwrap();
+    let adapter = crate::engine::tunnel().unwrap().inner().route().proxies["DIRECT"].clone();
+    let echo = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = echo.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = echo.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = [0; 4];
+            stream.read_exact(&mut bytes).unwrap();
+            stream.write_all(&bytes).unwrap();
+        }
+    });
+    for follow_policy in [false, true] {
+        if follow_policy {
+            let updated = profile.replace("follow-policy: false", "follow-policy: true");
+            let response = crate::engine::request(
+                "PUT",
+                "/configs",
+                &serde_json::json!({"payload": STANDARD.encode(updated)}).to_string(),
+            )
+            .unwrap();
+            assert!(response.contains("\"status\":204"), "{response}");
+        }
+        // Reuse the old adapter and a main-resolved address; DIRECT must resolve
+        // the hostname through the current generation's dedicated nameservers.
+        crate::get_runtime().block_on(async {
+            let metadata = meow_common::Metadata {
+                host: "lookup.test".into(),
+                dst_ip: Some("192.0.2.31".parse().unwrap()),
+                dst_port: port,
+                ..Default::default()
+            };
+            let mut stream = adapter.dial_tcp(&metadata).await.unwrap();
+            stream.write_all(b"ping").await.unwrap();
+            let mut bytes = [0; 4];
+            stream.read_exact(&mut bytes).await.unwrap();
+            assert_eq!(&bytes, b"ping");
+        });
+        assert!(direct.count.load(Ordering::Relaxed) > 0);
+        assert_eq!(policy.count.load(Ordering::Relaxed) > 0, follow_policy);
+    }
+    assert_eq!(main.count.load(Ordering::Relaxed), 0);
+    crate::engine::stop();
+    server.join().unwrap();
 }
 
 #[cfg(unix)]

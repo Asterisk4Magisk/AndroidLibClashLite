@@ -38,15 +38,7 @@ pub fn normalize(value: &mut Value) -> Vec<Diagnostic> {
             "geodata",
             &["geodata-mode", "geodata-loader", "geoip-matcher"][..],
         ),
-        (
-            "dns",
-            &[
-                "direct-nameserver",
-                "direct-nameserver-follow-policy",
-                "respect-rules",
-                "prefer-h3",
-            ][..],
-        ),
+        ("dns", &["respect-rules", "prefer-h3"][..]),
         (
             "tun",
             &[

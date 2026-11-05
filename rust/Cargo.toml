@@ -1,6 +1,6 @@
 [package]
 name = "libclash-rs"
-version = "0.28.0-android.1"
+version = "0.29.0-android.1"
 edition = "2021"
 rust-version = "1.89"
 license = "LGPL-3.0-only"

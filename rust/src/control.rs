@@ -87,6 +87,10 @@ fn restart_fields(
         "authentication",
         "skip-auth-prefixes",
         "sniffer",
+        "tcp-keepalive",
+        "tcp-keepalive-idle",
+        "tcp-keepalive-interval",
+        "tcp-keepalive-probes",
     ] {
         if old[field] != new[field] {
             fields.push(field);

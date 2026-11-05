@@ -421,7 +421,7 @@
  pub mod dns_parser;
  pub mod dropped_providers;
  pub mod ech_dns;
-@@ -213,7 +214,7 @@
+@@ -218,7 +219,7 @@
  /// `ListenerSpec::TProxy::firewall` serde default: managed firewall rules
  /// stay on when a persisted spec predates the field (issue #563).
  fn default_tproxy_firewall() -> bool {
@@ -430,7 +430,7 @@
  }
  
  /// `ListenerSpec::TProxy::udp_timeout` serde default, in seconds — matches
-@@ -1977,7 +1978,9 @@
+@@ -1987,7 +1988,9 @@
      !BUILTIN_GLOBAL_POLICIES
          .iter()
          .any(|policy| name.eq_ignore_ascii_case(policy))
@@ -441,39 +441,26 @@
  }
  
  /// The target of the LAST top-level `MATCH,<target>` rule — the config's
-@@ -2087,10 +2090,22 @@
-     raw_proxies: &[HashMap<String, serde_json::Value>],
-     ipv6: bool,
-     strict: bool,
-+    resolver: Option<&meow_dns::ResolverSlot>,
- ) -> Result<std::collections::HashSet<SmolStr>, anyhow::Error> {
+@@ -2102,7 +2105,17 @@
      let mut placeholder_names = std::collections::HashSet::new();
      for raw_proxy in raw_proxies {
--        let (proxy, placeholder_bound) = match proxy_parser::parse_proxy(raw_proxy, ipv6) {
-+        let parsed = if raw_proxy.get("type").and_then(|v| v.as_str()) == Some("dns") {
-+            let name = raw_proxy
-+                .get("name")
-+                .and_then(|v| v.as_str())
-+                .unwrap_or("dns-out");
-+            Ok(Arc::new(proxy_parser::WrappedProxy::new(Box::new(
-+                dns_outbound::DnsAdapter::new(name, resolver.cloned()),
-+            ))) as Arc<dyn Proxy>)
-+        } else {
-+            proxy_parser::parse_proxy(raw_proxy, ipv6)
-+        };
-+        let (proxy, placeholder_bound) = match parsed {
-             Ok(proxy) => (proxy, false),
-             Err(e) if strict => {
-                 let name = raw_proxy
-@@ -2383,6 +2398,7 @@
-         raw.proxies.as_deref().unwrap_or(&[]),
-         ipv6,
-         strict,
-+        resolver,
-     )?;
- 
-     let raw_groups = raw.proxy_groups.as_deref().unwrap_or(&[]);
-@@ -4499,15 +4515,18 @@
+         let (proxy, placeholder_bound) =
+-            match proxy_parser::parse_static_proxy(raw_proxy, ipv6, resolver) {
++            match if raw_proxy.get("type").and_then(|v| v.as_str()) == Some("dns") {
++                let name = raw_proxy
++                    .get("name")
++                    .and_then(|v| v.as_str())
++                    .unwrap_or("dns-out");
++                Ok(Arc::new(proxy_parser::WrappedProxy::new(Box::new(
++                    dns_outbound::DnsAdapter::new(name, resolver.cloned()),
++                ))) as Arc<dyn Proxy>)
++            } else {
++                proxy_parser::parse_static_proxy(raw_proxy, ipv6, resolver)
++            } {
+                 Ok(proxy) => (proxy, false),
+                 Err(e) if strict => {
+                     let name = raw_proxy
+@@ -4651,15 +4664,18 @@
              "tproxy",
              ListenerSpec::TProxy {
                  sni: global_tproxy_sni,
@@ -498,7 +485,7 @@
              global_max_conns,
          )?;
      }
-@@ -4576,6 +4595,7 @@
+@@ -4728,6 +4744,7 @@
          // UDP TPROXY is IPv4-only in this release (issue #564): `::` is
          // dual-stack on Linux and would silently accept v6 datagrams, so
          // reject it rather than claim partial dual-stack support.
@@ -506,66 +493,6 @@
          if let ListenerSpec::TProxy { udp: true, .. } = spec {
              let v4 = listen
                  .parse::<std::net::IpAddr>()
-@@ -4990,7 +5010,15 @@
-     async fn missing_plugin_node_binds_a_dead_placeholder() {
-         let mut proxies = HashMap::new();
-         let mut names = std::collections::HashSet::new();
--        insert_parsed_leaves(&mut proxies, &mut names, &[raw_gost_node()], false, false).unwrap();
-+        insert_parsed_leaves(
-+            &mut proxies,
-+            &mut names,
-+            &[raw_gost_node()],
-+            false,
-+            false,
-+            None,
-+        )
-+        .unwrap();
-         let bound = proxies
-             .get("s-gost")
-             .expect("a missing-plugin node must stay bound, not dropped");
-@@ -5004,8 +5032,15 @@
-     fn missing_plugin_node_still_hard_errors_under_strict() {
-         let mut proxies = HashMap::new();
-         let mut names = std::collections::HashSet::new();
--        let err = insert_parsed_leaves(&mut proxies, &mut names, &[raw_gost_node()], false, true)
--            .unwrap_err();
-+        let err = insert_parsed_leaves(
-+            &mut proxies,
-+            &mut names,
-+            &[raw_gost_node()],
-+            false,
-+            true,
-+            None,
-+        )
-+        .unwrap_err();
-         assert!(
-             err.to_string().contains("strict mode"),
-             "strict must still hard-error: {err}"
-@@ -5182,6 +5217,7 @@
-             &[raw_direct_dup(), raw_dead_dup()],
-             false,
-             false,
-+            None,
-         )
-         .unwrap();
-         assert_eq!(
-@@ -5204,6 +5240,7 @@
-             &[raw_dead_dup(), raw_direct_dup()],
-             false,
-             false,
-+            None,
-         )
-         .unwrap();
-         assert_eq!(
-@@ -6054,7 +6091,7 @@
-         let mut names = std::collections::HashSet::new();
- 
-         tracing::subscriber::with_default(subscriber, || {
--            insert_parsed_leaves(&mut proxies, &mut names, &raws, false, false).unwrap();
-+            insert_parsed_leaves(&mut proxies, &mut names, &raws, false, false, None).unwrap();
-         });
- 
-         assert_eq!(proxies.len(), 1, "last-wins is unchanged");
 --- a/crates/meow-config/src/internal_http.rs
 +++ b/crates/meow-config/src/internal_http.rs
 @@ -168,6 +168,35 @@

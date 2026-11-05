@@ -85,7 +85,7 @@ pub fn capabilities() -> String {
         "congestionControllers":[], "congestionControllerStacks":[],
         "listenerHotReload":false, "connectionTracking":["tcp"], "memoryMetric":"rss",
         "configDiagnostics":true, "uiSubtitlePattern":true,
-        "dnsOptions":{"direct-nameserver":false,"respect-rules":false,"prefer-h3":false}
+        "dnsOptions":{"direct-nameserver":true,"direct-nameserver-follow-policy":true,"respect-rules":false,"prefer-h3":false}
     })
     .to_string()
 }
@@ -173,6 +173,7 @@ async fn start_config(
     tunnel.set_dialer_registry(config.provider_dialer_registry.clone());
     tunnel.set_mode(config.general.mode);
     tunnel.set_connection_notes(config.general.connection_notes);
+    tunnel.set_tcp_idle_timeout(config.general.tcp_idle_timeout);
     tunnel.update_routing(config.proxies, config.rules, config.dialer_registry);
     tunnel.spawn_background_tasks();
     tunnel.reconcile_health_checks(&meow_config::extract_health_check_specs(
@@ -214,7 +215,14 @@ async fn start_config(
     let sniffer = Arc::new(SnifferRuntime::new(config.sniffer));
     let mut named = config.listeners.named;
     for listener in &mut named {
-        crate::listeners::start(listener, &tunnel, &sniffer, &config.auth).await?;
+        crate::listeners::start(
+            listener,
+            &tunnel,
+            &sniffer,
+            &config.auth,
+            config.listeners.tcp_keepalive,
+        )
+        .await?;
     }
     let address = config.api.external_controller;
     let app = Arc::new(AppState {

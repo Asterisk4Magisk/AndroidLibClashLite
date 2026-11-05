@@ -120,8 +120,6 @@ dns:
   direct-nameserver: [system]
 rules: ["MATCH,DIRECT"]
 '''
-        if args.core == 'meow':
-            config_text = config_text.replace('  direct-nameserver: [system]\n', '')
         config.write_text(config_text)
         call('push', str(config), home + '/config.yaml')
         for port in ('19090', '18080'):
@@ -170,8 +168,7 @@ rules: ["MATCH,DIRECT"]
             assert not negative.get('Answer'), negative
             if args.core == 'mihomo':
                 assert negative['Status'] == 3
-            # meow has no direct-nameserver option; DIRECT uses its normal resolver.
-            direct_host = 'example.org' if args.core == 'mihomo' else 'example.com'
+            direct_host = 'example.org'
             with socket.create_connection(('127.0.0.1', 18080), timeout=15) as proxy:
                 proxy.settimeout(15)
                 proxy.sendall(f'CONNECT {direct_host}:443 HTTP/1.1\r\nHost: {direct_host}:443\r\n\r\n'.encode())

@@ -164,8 +164,7 @@ configuration option is tolerated. Unknown keys can be ignored by callers.
 (`code`, `field`, `message`), without changing the live configuration. It decrypts
 using the configured AGE identities. This is not full configuration validation;
 the Go implementation returns `[]` for a parseable Go profile. Rust reports and
-ignores known unsupported DNS options (`direct-nameserver`,
-`direct-nameserver-follow-policy`, `respect-rules`, `prefer-h3`), geodata selection
+ignores known unsupported DNS options (`respect-rules`, `prefer-h3`), geodata selection
 options, `unified-delay`, `tcp-concurrent` and unsupported TUN tuning fields.
 These options cannot block startup and do not change existing Meow behavior.
 Diagnostics omit option values, subscription URLs and credentials. Startup/load
@@ -175,11 +174,13 @@ placeholders; `strict: true` enables upstream's stricter validation. Malformed Y
 decryption, unavailable resources and port binding failures remain real errors.
 
 For Rust ROOT `PUT /configs`, changes to named/shorthand listeners, controller,
-secret, external UI, inbound authentication or sniffer settings return HTTP 409:
+secret, external UI, inbound authentication, sniffer or `tcp-keepalive*` settings
+return HTTP 409:
 `{"code":"RESTART_REQUIRED","message":"...","fields":["listeners"]}`.
 This happens before any config change, including with `force=true`; the running
 configuration stays intact. Routing/DNS/provider changes keep the upstream hot
-reload path. Restart the CLI for startup-only settings. JNI `load`/`loadFromBytes`
+reload path. `tcp-idle-timeout` applies at startup and can be hot reloaded for
+new relays. Restart the CLI for startup-only settings. JNI `load`/`loadFromBytes`
 already perform the required full rebuild within the library. `PATCH /configs`
 retains the upstream mode/log-level/TUN contract.
 
@@ -225,9 +226,10 @@ The upstream UDP path excludes destinations whose port equals the listener port.
 ## System DNS
 
 Use `system` or `system://` wherever Meow accepts DNS upstreams, including
-`nameserver`, `default-nameserver`, `proxy-server-nameserver` and
-`nameserver-policy`. `direct-nameserver` is not implemented by pinned Meow;
-DIRECT continues to use its normal resolver.
+`nameserver`, `default-nameserver`, `proxy-server-nameserver`, `direct-nameserver`
+and `nameserver-policy`. DIRECT outbounds use `direct-nameserver` when configured;
+`direct-nameserver-follow-policy: true` also applies `nameserver-policy` to those
+lookups. Without `direct-nameserver`, DIRECT uses its normal resolver.
 
 For JNI, call `notifyDnsChanged` with the underlying physical network's complete
 comma-separated `IP:port` list before startup and whenever it changes. Bracket
