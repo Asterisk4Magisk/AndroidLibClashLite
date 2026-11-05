@@ -1,0 +1,193 @@
+--- a/crates/meow-proxy/src/group/selector.rs
++++ b/crates/meow-proxy/src/group/selector.rs
+@@ -12,7 +12,9 @@
+     name: SmolStr,
+     static_proxies: Vec<Arc<dyn Proxy>>,
+     provider_slots: Vec<ProviderSlot>,
+-    /// Name of the currently selected proxy; `None` means use the first.
++    /// Optional fallback independent of member display order.
++    default_proxy: Option<Arc<dyn Proxy>>,
++    /// Name of the currently selected proxy; `None` means use the default.
+     /// (Upstream prefers a `COMPATIBLE` member as the initial default;
+     /// we keep the simpler first-member default — COMPATIBLE dials like
+     /// DIRECT either way, so the divergence is cosmetic.)
+@@ -29,6 +31,7 @@
+             name: SmolStr::from(name),
+             static_proxies: proxies,
+             provider_slots: Vec::new(),
++            default_proxy: None,
+             selected: RwLock::new(None),
+             store: None,
+             health: ProxyHealth::new(),
+@@ -45,11 +48,25 @@
+             name: SmolStr::from(name),
+             static_proxies: proxies,
+             provider_slots: slots,
++            default_proxy: None,
+             selected: RwLock::new(None),
+             store: None,
+             health: ProxyHealth::new(),
+             display: GroupDisplay::default(),
+         }
++    }
++
++    /// Use a static member as the fallback without moving it in the list.
++    /// Saved or manual choices still take precedence, while a removed choice
++    /// falls back to this member rather than the first displayed member.
++    #[must_use]
++    pub fn with_default(mut self, name: &str) -> Self {
++        self.default_proxy = self
++            .static_proxies
++            .iter()
++            .find(|p| p.name() == name)
++            .cloned();
++        self
+     }
+ 
+     /// Attach a persistent store. The previously-saved choice (if any) is
+@@ -101,10 +118,10 @@
+ 
+     /// Resolve `selected` to an `Arc<dyn Proxy>` without allocating a unified
+     /// `Vec`. Walks `static_proxies` then provider slots; falls back to the
+-    /// first proxy if `selected` is unset or names something no longer present.
++    /// configured default (or first proxy) if the choice is unset or removed.
+     pub fn selected_proxy(&self) -> Option<Arc<dyn Proxy>> {
+         let sel: Option<SmolStr> = self.selected.read().clone();
+-        let mut first_any: Option<Arc<dyn Proxy>> = None;
++        let mut first_any = self.default_proxy.clone();
+         if let Some(name) = sel {
+             for p in &self.static_proxies {
+                 if first_any.is_none() {
+@@ -126,6 +143,9 @@
+                 }
+             }
+             return first_any;
++        }
++        if let Some(p) = &self.default_proxy {
++            return Some(Arc::clone(p));
+         }
+         if let Some(p) = self.static_proxies.first() {
+             return Some(Arc::clone(p));
+--- a/crates/meow-config/src/lib.rs
++++ b/crates/meow-config/src/lib.rs
+@@ -2655,62 +2655,48 @@
+         ));
+     }
+ 
+-    // Auto-create GLOBAL selector if not defined by user (mihomo compatibility).
+-    // clash-nyanpasu and other frontends depend on GLOBAL to build proxy tree.
+-    // Keep the complete sorted list they expect, but put the config's primary
+-    // outbound first: SelectorGroup uses its first member when no choice has
+-    // been stored, and sorting every registry key previously made global mode
+-    // default to DIRECT or an alphabetically-first quota/expiry pseudo-node.
++    // Match mihomo's GLOBAL member order: built-ins, declared leaves, then
++    // declared groups. Resolve names after construction so forward references
++    // and dependency build order cannot change the frontend's group order.
+     let had_global = proxies.contains_key("GLOBAL");
+     if !had_global {
+-        let mut all_proxy_names: Vec<String> = proxies
+-            .iter()
+-            // Upstream seeds the GLOBAL member provider from `proxyList` —
+-            // DIRECT, REJECT, user leaves and groups — so RejectDrop and
+-            // Compatible never appear as members (COMPATIBLE is only the
+-            // default selection), and the Pass/PassRule types are filtered
+-            // as match-loop signals (config.go ~line 967).
+-            .filter(|(_, p)| {
++        let mut seen = std::collections::HashSet::new();
++        let all_proxies = ["DIRECT", "REJECT"]
++            .into_iter()
++            .chain(
++                raw.proxies
++                    .as_deref()
++                    .unwrap_or(&[])
++                    .iter()
++                    .filter_map(|proxy| proxy.get("name").and_then(serde_json::Value::as_str)),
++            )
++            .chain(raw_groups.iter().map(|group| group.name.as_str()))
++            .filter(|name| seen.insert(*name))
++            .filter_map(|name| proxies.get(name))
++            .filter(|proxy| {
+                 !matches!(
+-                    p.adapter_type(),
++                    proxy.adapter_type(),
+                     AdapterType::Pass
+                         | AdapterType::PassRule
+                         | AdapterType::Compatible
+                         | AdapterType::RejectDrop
+                 )
+             })
+-            .map(|(name, _)| name.to_string())
++            .cloned()
+             .collect();
+-        all_proxy_names.sort();
+-        let primary = primary_global_target(raw, &proxies).map(str::to_string);
+-        if let Some(primary) = primary.as_deref() {
+-            if let Some(position) = all_proxy_names.iter().position(|name| name == primary) {
+-                all_proxy_names.remove(position);
+-                all_proxy_names.insert(0, primary.to_string());
+-            }
+-        }
+-        let global_config = raw::RawProxyGroup {
+-            name: "GLOBAL".to_string(),
+-            group_type: "select".to_string(),
+-            proxies: Some(all_proxy_names),
+-            ..Default::default()
+-        };
+-        match proxy_parser::parse_proxy_group_with_store(
+-            &global_config,
+-            &proxies,
+-            &[],
+-            providers,
+-            selector_store,
+-        ) {
+-            Ok(group) => {
+-                proxies.insert(SmolStr::new_static("GLOBAL"), group);
+-                info!(
+-                    primary = primary.as_deref().unwrap_or("DIRECT"),
+-                    "Auto-created GLOBAL selector with all proxies"
+-                );
+-            }
+-            Err(e) => warn!("Failed to create GLOBAL selector: {}", e),
+-        }
++        let primary = primary_global_target(raw, &proxies);
++        let mut global = meow_proxy::SelectorGroup::new("GLOBAL", all_proxies);
++        if let Some(primary) = primary {
++            global = global.with_default(primary);
++        }
++        if let Some(store) = selector_store {
++            global = global.with_store(Arc::clone(store));
++        }
++        proxies.insert(SmolStr::new_static("GLOBAL"), Arc::new(global));
++        info!(
++            primary = primary.unwrap_or("DIRECT"),
++            "Auto-created GLOBAL selector with all proxies"
++        );
+     }
+     // Whether `GLOBAL` is the auto-created all-registry selector or a declared
+     // group changes what a `dialer-proxy: GLOBAL` edge can reach.
+--- a/crates/meow-config/tests/config_persistence_test.rs
++++ b/crates/meow-config/tests/config_persistence_test.rs
+@@ -240,12 +240,17 @@
+ 
+     assert_eq!(global.current().as_deref(), Some("Proxies"));
+     let members = global.members().expect("GLOBAL selector members");
+-    assert_eq!(members.first().map(String::as_str), Some("Proxies"));
+-    assert!(members.contains(&"137.15 G | 500.00 G".to_string()));
+-    assert!(members.contains(&"AutoSelect".to_string()));
+-    assert!(members.contains(&"HK 01".to_string()));
+-    assert!(members.contains(&"DIRECT".to_string()));
+-    assert!(members.contains(&"REJECT".to_string()));
++    assert_eq!(
++        members,
++        [
++            "DIRECT",
++            "REJECT",
++            "137.15 G | 500.00 G",
++            "HK 01",
++            "AutoSelect",
++            "Proxies"
++        ]
++    );
+ }
+ 
+ /// Issue #533: the match-loop signal adapters register as real built-ins,

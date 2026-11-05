@@ -38,6 +38,82 @@ fn api(method: &str, path: &str, body: &str) -> serde_json::Value {
 }
 
 #[test]
+fn proxy_group_order_survives_reload_and_saved_selection() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    let _operation = engine::OPERATION.lock();
+    let path = directory();
+    let _cleanup = Cleanup(path.clone());
+    let home = path.to_str().unwrap();
+    let groups = "  - {name: Proxy, type: select, proxies: [Final]}\n  - {name: Youtube, type: select, proxies: [node-z]}\n  - {name: Apple, type: select, proxies: [node-a]}\n  - {name: Final, type: select, proxies: [node-z]}\n";
+    let profile = format!(
+        "mode: rule\nlog-level: silent\nlogbook: {{enable: false}}\nproxies:\n  - {{name: node-z, type: socks5, server: 127.0.0.1, port: 1}}\n  - {{name: node-a, type: socks5, server: 127.0.0.1, port: 2}}\nproxy-groups:\n{groups}rules: ['MATCH,Final']\n"
+    );
+    let global = || -> serde_json::Value {
+        let response = api("GET", "/proxies", "");
+        assert_eq!(response["status"], 200);
+        let body: serde_json::Value =
+            serde_json::from_str(response["body"].as_str().unwrap()).unwrap();
+        body["proxies"]["GLOBAL"].clone()
+    };
+    let expected = serde_json::json!([
+        "DIRECT", "REJECT", "node-z", "node-a", "Proxy", "Youtube", "Apple", "Final"
+    ]);
+
+    engine::start(home, home, profile.as_bytes(), None).unwrap();
+    assert_eq!(global()["all"], expected);
+    assert_eq!(global()["now"], "Final");
+    // Hot reload must follow the new declaration order and keep the default.
+    let reordered = profile.replace(
+        groups,
+        "  - {name: Apple, type: select, proxies: [node-a]}\n  - {name: Proxy, type: select, proxies: [Final]}\n  - {name: Final, type: select, proxies: [node-z]}\n  - {name: Youtube, type: select, proxies: [node-z]}\n",
+    );
+    let body = serde_json::json!({"payload": STANDARD.encode(&reordered)}).to_string();
+    assert_eq!(api("PUT", "/configs", &body)["status"], 204);
+    let reordered_expected = serde_json::json!([
+        "DIRECT", "REJECT", "node-z", "node-a", "Apple", "Proxy", "Final", "Youtube"
+    ]);
+    assert_eq!(global()["all"], reordered_expected);
+    assert_eq!(global()["now"], "Final");
+
+    // Use a fresh session's store for persistence checks. Hot reload's upstream
+    // process-global store can belong to an earlier test in this executable.
+    engine::stop();
+    engine::start(home, home, reordered.as_bytes(), None).unwrap();
+    assert_eq!(
+        api("PUT", "/proxies/GLOBAL", r#"{"name":"Youtube"}"#)["status"],
+        204
+    );
+    assert_eq!(global()["all"], reordered_expected);
+    assert_eq!(global()["now"], "Youtube");
+
+    engine::stop();
+    engine::start(home, home, reordered.as_bytes(), None).unwrap();
+    assert_eq!(global()["all"], reordered_expected);
+    assert_eq!(global()["now"], "Youtube");
+
+    // A removed saved choice falls back to the primary outbound, not DIRECT.
+    engine::stop();
+    let removed = reordered.replace("  - {name: Youtube, type: select, proxies: [node-z]}\n", "");
+    engine::start(home, home, removed.as_bytes(), None).unwrap();
+    assert_eq!(global()["now"], "Final");
+
+    // An explicitly configured GLOBAL retains its member order and default.
+    engine::stop();
+    std::fs::remove_file(path.join("selector-cache.json")).unwrap();
+    let explicit = profile.replace(
+        "proxy-groups:\n",
+        "proxy-groups:\n  - {name: GLOBAL, type: select, proxies: [node-a, Proxy, DIRECT]}\n",
+    );
+    engine::start(home, home, explicit.as_bytes(), None).unwrap();
+    assert_eq!(
+        global()["all"],
+        serde_json::json!(["node-a", "Proxy", "DIRECT"])
+    );
+    assert_eq!(global()["now"], "node-a");
+}
+
+#[test]
 fn embedded_control_data_and_restart() {
     let _operation = engine::OPERATION.lock();
     let path = directory();

@@ -18,6 +18,10 @@ shared dependency cache; do not edit them as project source.
   physical-network snapshots with bootstrap/ECH DNS, invalidates DNS caches and
   pooled connections after updates, and selects the proper UDP socket family.
   DNS wire encoding, validation, TCP truncation fallback and routing stay upstream.
+- `global-proxy-order.patch`: preserves Mihomo's GLOBAL member order (DIRECT,
+  REJECT, declared proxies, declared groups) independently of dependency build
+  order. The primary outbound remains the default without moving it in the list;
+  saved selections take precedence and removed selections fall back to the primary.
 
 Preparation checks every patch against the pinned sources before applying it.
 When updating the pin, review and regenerate these patches, then run the Android
