@@ -1,0 +1,22 @@
+// Copyright 2026, Asterisk4Magisk contributors
+// SPDX-License-Identifier: LGPL-3.0
+
+package cachefile
+
+import (
+	"sync"
+
+	"github.com/metacubex/mihomo/log"
+)
+
+// AsteriskReset closes an opened cache and lets the next Cache call reopen it.
+// It never opens a cache that was not initialized.
+func AsteriskReset() {
+	if defaultCache != nil && defaultCache.DB != nil {
+		if err := defaultCache.Close(); err != nil {
+			log.Warnln("[CacheFile] close cache file failed: %s", err.Error())
+		}
+	}
+	defaultCache = nil
+	initOnce = sync.Once{}
+}

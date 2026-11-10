@@ -3,7 +3,6 @@
 
 """Prepare Mihomo/Go sources and CLI/CMFA overlays without editing pinned upstream."""
 import json
-import pathlib
 import re
 import shutil
 
@@ -112,7 +111,12 @@ def prepare_sources(repo, work, core):
           '\t"github.com/metacubex/mihomo/tunnel"\n\n\t"cfa/native/autoswitch"\n)')
     patch('hub/executor/executor.go', '\ttunnel.OnRunning()\n',
           '\ttunnel.OnRunning()\n\tautoswitch.Apply(cfg.AsteriskAutoSwitch)\n')
-    patches['log/log.go'] = (repo / 'overlay/mihomo/log/log.go').read_text(encoding='utf-8')
+    # Stamp log events when they are created; a subscriber-side clock would
+    # include queueing delay.
+    patch('log/log.go', '\t"os"\n', '\t"os"\n\t"time"\n')
+    patch('log/log.go', '\tPayload  string\n}', '\tPayload  string\n\tTime     time.Time\n}')
+    patch('log/log.go', '\t\tPayload:  fmt.Sprintf(format, v...),\n',
+          '\t\tPayload:  fmt.Sprintf(format, v...),\n\t\tTime:     time.Now(),\n')
 
     # Dependencies enforce ordering before even package-level cached env settings.
     replacements = {}
@@ -134,6 +138,15 @@ def prepare_sources(repo, work, core):
         replacement.parent.mkdir(parents=True, exist_ok=True)
         replacement.write_text(text, encoding='utf-8')
         replacements[str(original)] = str(replacement)
+    # The cache singleton is private; reset it from inside its own package so
+    # the compiler checks the state this depends on.
+    cache_reset = core / 'component/profile/cachefile/asterisk_reset.go'
+    if cache_reset.exists():
+        raise ValueError(f'Upstream changed: {cache_reset.name} now exists')
+    replacement = work / 'overlay' / cache_reset.relative_to(core)
+    replacement.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(repo / 'native/profilecache/cachefile_reset.go.txt', replacement)
+    replacements[str(cache_reset)] = str(replacement)
     overlay = work / 'overlay.json'
     overlay.write_text(json.dumps({'Replace': replacements}), encoding='utf-8')
     return source, overlay
