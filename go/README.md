@@ -155,8 +155,7 @@ connectivity service when system_server restarts, clears DNS and shuts the core
 down gracefully with status 70. JNI continues to use `notifyDnsChanged` from its
 host app.
 
-Build with `scripts/build_go.py`; local AsteriskMETA builds can consume the
-AAR via `-PandroidLibClashLiteAar=/path/libclash.aar`.
+Build with `scripts/build_go.py`.
 
 ## Auto-switch
 
