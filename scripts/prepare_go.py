@@ -40,6 +40,13 @@ def prepare_sources(repo, work, core):
         text = patches.get(name, (core / name).read_text(encoding='utf-8'))
         patches[name] = replace_once(text, old, new)
 
+    # Manual JNI/API group tests use the caller's URL. Background health checks
+    # and automatic selection keep the group's configured testUrl.
+    patch('adapter/outboundgroup/urltest.go',
+          '\treturn u.GroupBase.URLTest(ctx, u.testUrl, expectedStatus)',
+          '\tif url == "" {\n\t\turl = u.testUrl\n\t}\n'
+          '\treturn u.GroupBase.URLTest(ctx, url, expectedStatus)')
+
     # A single binary must support both Android embedding and standalone ROOT.
     patch('constant/features/cmfa.go', 'const CMFA = true',
           'import "cfa/environment"\n\nvar CMFA = !environment.IsCLI')
