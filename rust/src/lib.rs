@@ -7,6 +7,8 @@ mod compat;
 mod compatibility;
 mod control;
 mod engine;
+#[cfg(unix)]
+mod flowmeta;
 mod jni_api;
 mod listeners;
 mod logging;

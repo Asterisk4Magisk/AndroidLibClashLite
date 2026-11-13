@@ -6,7 +6,17 @@ automatically. `--source PATH` accepts an existing upstream Git checkout for
 offline preparation. Generated sources live in `rust/.upstream/`, outside Cargo's
 shared dependency cache; do not edit them as project source.
 
-- `android-tproxy.patch`: enables the Android listener path, obtains the original
+Patch filenames use four-digit prefixes and are applied in filename order.
+Keep this ordering when adding or renumbering patches.
+
+- `0001-android-lwip-errno.patch`: selects LwIP's direct system errno include on
+  Android, preventing an existing `errno` macro from expanding inside the
+  indirect header name with newer NDK headers.
+- `0002-android-system-dns.patch`: adds a dynamic `system` nameserver transport, shares
+  physical-network snapshots with bootstrap/ECH DNS, invalidates DNS caches and
+  pooled connections after updates, and selects the proper UDP socket family.
+  DNS wire encoding, validation, TCP truncation fallback and routing stay upstream.
+- `0003-android-tproxy.patch`: enables the Android listener path, obtains the original
   TCP destination from the accepted transparent socket, extends UDP address and
   ancillary handling to IPv6, and maps Android `tproxy-port` to an externally
   managed TCP+UDP listener. Relay, sniffing, flow control and UDP sessions remain
@@ -14,11 +24,7 @@ shared dependency cache; do not edit them as project source.
   outbound backed by the live resolver, ROOT UID/package lookup, externally
   managed named-listener firewall defaults, and subscription redirect/HWID
   handling through the existing HTTP transport.
-- `android-system-dns.patch`: adds a dynamic `system` nameserver transport, shares
-  physical-network snapshots with bootstrap/ECH DNS, invalidates DNS caches and
-  pooled connections after updates, and selects the proper UDP socket family.
-  DNS wire encoding, validation, TCP truncation fallback and routing stay upstream.
-- `global-proxy-order.patch`: preserves Mihomo's GLOBAL member order (DIRECT,
+- `0004-global-proxy-order.patch`: preserves Mihomo's GLOBAL member order (DIRECT,
   REJECT, declared proxies, declared groups) independently of dependency build
   order. The primary outbound remains the default without moving it in the list;
   saved selections take precedence and removed selections fall back to the primary.

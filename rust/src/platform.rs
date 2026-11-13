@@ -9,6 +9,11 @@ use jni::{
 use parking_lot::RwLock;
 use std::{net::SocketAddr, sync::Arc};
 
+#[cfg(unix)]
+mod packages;
+#[cfg(unix)]
+mod socket_owner;
+
 struct Callbacks {
     vm: JavaVM,
     object: GlobalRef,
@@ -68,6 +73,42 @@ pub struct Owner {
 pub const IPPROTO_TCP: i32 = 6;
 pub const IPPROTO_UDP: i32 = 17;
 
+#[cfg(unix)]
+pub async fn lookup_bridge(
+    protocol: i32,
+    source: SocketAddr,
+    destination: SocketAddr,
+    uid: Option<u32>,
+) -> Option<Owner> {
+    if is_installed() {
+        return lookup(protocol, source, destination).await;
+    }
+    if let Some(uid) = uid {
+        let package = if unsafe { libc::geteuid() } == 0 {
+            tokio::task::spawn_blocking(move || packages::lookup(uid))
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        return Some(Owner { uid, package });
+    }
+    if unsafe { libc::geteuid() } != 0 || !is_local_source(source.ip()) {
+        return None;
+    }
+    tokio::task::spawn_blocking(move || {
+        let uid = socket_owner::lookup(protocol == IPPROTO_UDP, source, destination)?;
+        Some(Owner {
+            uid,
+            package: packages::lookup(uid),
+        })
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 pub async fn lookup(protocol: i32, source: SocketAddr, destination: SocketAddr) -> Option<Owner> {
     let callbacks = CALLBACKS.read().clone()?;
     tokio::task::spawn_blocking(move || callbacks.owner(protocol, source, destination).ok())
@@ -123,4 +164,45 @@ impl Callbacks {
         }
         result
     }
+}
+
+// A forwarded hotspot client cannot own a wildcard UDP socket on this device.
+#[cfg(unix)]
+fn is_local_source(source: std::net::IpAddr) -> bool {
+    let source = source.to_canonical();
+    if source.is_loopback() {
+        return true;
+    }
+    let mut head = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return false;
+    }
+    let mut current = head;
+    let mut found = false;
+    while !current.is_null() {
+        let interface = unsafe { &*current };
+        if !interface.ifa_addr.is_null() {
+            let address = unsafe { &*interface.ifa_addr };
+            let ip = match address.sa_family as i32 {
+                libc::AF_INET => {
+                    let address = unsafe { &*(interface.ifa_addr as *const libc::sockaddr_in) };
+                    Some(std::net::IpAddr::from(
+                        address.sin_addr.s_addr.to_ne_bytes(),
+                    ))
+                }
+                libc::AF_INET6 => {
+                    let address = unsafe { &*(interface.ifa_addr as *const libc::sockaddr_in6) };
+                    Some(std::net::IpAddr::from(address.sin6_addr.s6_addr))
+                }
+                _ => None,
+            };
+            if ip.is_some_and(|ip| ip.to_canonical() == source) {
+                found = true;
+                break;
+            }
+        }
+        current = interface.ifa_next;
+    }
+    unsafe { libc::freeifaddrs(head) };
+    found
 }

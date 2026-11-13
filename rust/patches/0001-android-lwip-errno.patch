@@ -1,0 +1,10 @@
+diff --git a/crates/meow-lwip/old-src/custom/arch/cc_others.h b/crates/meow-lwip/old-src/custom/arch/cc_others.h
+--- a/crates/meow-lwip/old-src/custom/arch/cc_others.h
++++ b/crates/meow-lwip/old-src/custom/arch/cc_others.h
+@@ -54,5 +54,5 @@
+ 
+ #define LWIP_ERRNO_INCLUDE <errno.h>
+ 
+-#if defined(LWIP_UNIX_LINUX) || defined(LWIP_UNIX_HURD)
++#if defined(LWIP_UNIX_LINUX) || defined(LWIP_UNIX_HURD) || defined(LWIP_UNIX_ANDROID)
+ #define LWIP_ERRNO_STDINCLUDE	1

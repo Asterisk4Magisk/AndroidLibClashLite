@@ -36,14 +36,14 @@ use tokio::sync::{mpsc, Notify, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::warn;
 
-type UdpMsg = (Vec<u8>, SocketAddr, SocketAddr);
+pub(crate) type UdpMsg = (Vec<u8>, SocketAddr, SocketAddr);
 type AnyIpPktFrame = Vec<u8>;
 type FlowTasks = Arc<Mutex<Vec<JoinHandle<()>>>>;
 type NatKey = (SocketAddr, SocketAddr);
 /// The NAT session each running reply reader serves, by NAT key. Holding the
 /// session (not just the key) lets a replacement session get its own reader
 /// while the evicted one's reader is still winding down.
-type ReplyReaders = Arc<Mutex<HashMap<NatKey, Arc<UdpSession>>>>;
+pub(crate) type ReplyReaders = Arc<Mutex<HashMap<NatKey, Arc<UdpSession>>>>;
 
 static TUN2SOCKS_ACTIVE: AtomicBool = AtomicBool::new(false);
 static TUN2SOCKS_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -267,7 +267,7 @@ async fn run_tun2socks(
                                         }
                                     }
                                 } else {
-                                    dispatch_udp(payload, src, dst, reply_tx, readers).await;
+                                    dispatch_udp(&payload, src, dst, &reply_tx, &readers, None, None).await;
                                 }
                             });
                             track_flow_task(&flow_tasks_lwip, handle);
@@ -433,7 +433,7 @@ async fn dispatch_tcp(stream: lwip::TcpStream, src_addr: SocketAddr, dst_addr: S
 
 /// Tag a flow with the app that opened it (see [`owner`]): the uid feeds
 /// UID rules, the package name PROCESS-NAME rules and the connections list.
-fn apply_owner(metadata: &mut Metadata, owner: Option<owner::Owner>) {
+pub(crate) fn apply_owner(metadata: &mut Metadata, owner: Option<owner::Owner>) {
     let Some(owner) = owner else {
         return;
     };
@@ -479,12 +479,14 @@ impl ProxyConn for NetstackConn {}
 // UDP dispatch
 // ---------------------------------------------------------------------------
 
-async fn dispatch_udp(
-    payload: Vec<u8>,
+pub(crate) async fn dispatch_udp(
+    payload: &[u8],
     src: SocketAddr,
     dst: SocketAddr,
-    reply_tx: mpsc::Sender<UdpMsg>,
-    reply_readers: ReplyReaders,
+    reply_tx: &mpsc::Sender<UdpMsg>,
+    reply_readers: &ReplyReaders,
+    supplied_uid: Option<u32>,
+    inbound: Option<SocketAddr>,
 ) {
     let Some(tunnel) = engine::tunnel() else {
         return;
@@ -493,7 +495,17 @@ async fn dispatch_udp(
 
     let mut metadata = Metadata {
         network: Network::Udp,
-        conn_type: ConnType::Inner,
+        conn_type: if inbound.is_some() {
+            ConnType::Tun
+        } else {
+            ConnType::Inner
+        },
+        in_name: if inbound.is_some() {
+            "asterisk-bridge".into()
+        } else {
+            Default::default()
+        },
+        in_port: inbound.map(|address| address.port()).unwrap_or_default(),
         src_ip: Some(src.ip()),
         src_port: src.port(),
         dst_ip: Some(dst.ip()),
@@ -525,11 +537,11 @@ async fn dispatch_udp(
     if !inner.nat_table.contains_key(&key) {
         apply_owner(
             &mut metadata,
-            owner::lookup(owner::IPPROTO_UDP, src, dst).await,
+            owner::lookup_bridge(owner::IPPROTO_UDP, src, dst, supplied_uid).await,
         );
     }
 
-    meow_tunnel::udp::handle_udp(inner, &payload, src, metadata).await;
+    meow_tunnel::udp::handle_udp(inner, payload, src, metadata).await;
 
     let Some(session) = inner.nat_table.get(&key).map(|r| Arc::clone(r.value())) else {
         return;
@@ -550,8 +562,8 @@ async fn dispatch_udp(
         session,
         src,
         dst,
-        reply_tx,
-        reply_readers,
+        reply_tx.clone(),
+        reply_readers.clone(),
         Arc::clone(inner),
     );
 }

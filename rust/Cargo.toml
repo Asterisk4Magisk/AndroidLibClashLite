@@ -20,6 +20,7 @@ meow-listener = { path = ".upstream/meow/crates/meow-listener", features = ["lis
 lwip = { package = "meow-lwip", path = ".upstream/meow/crates/meow-lwip" }
 anyhow = "1"
 base64 = "0.22"
+bytes = "1"
 fancy-regex = "0.16"
 axum = { version = "0.8", features = ["ws"] }
 dashmap = "6"

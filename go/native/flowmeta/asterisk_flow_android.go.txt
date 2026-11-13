@@ -1,0 +1,50 @@
+// Copyright 2026, Asterisk4Magisk contributors
+// SPDX-License-Identifier: LGPL-3.0
+
+//go:build android
+
+package process
+
+import (
+	"net/netip"
+	"os"
+
+	"cfa/native/flowmeta"
+	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/constant/features"
+)
+
+var flowPackages = flowmeta.PackageCache{Path: "/data/system/packages.list"}
+
+func init() {
+	flowOwnerResolver = resolveFlowOwner
+}
+
+func resolveFlowOwner(metadata *C.Metadata) {
+	// The embedded VPN path uses platform callbacks and never reads ROOT files.
+	if features.CMFA {
+		if name, err := FindPackageName(metadata); err == nil {
+			metadata.Process = name
+		}
+		return
+	}
+	if os.Geteuid() != 0 {
+		return
+	}
+	if metadata.Uid == flowmeta.UnknownUID {
+		source, err := netip.ParseAddrPort(metadata.RawSrcAddr.String())
+		if err != nil {
+			return
+		}
+		destination, err := netip.ParseAddrPort(metadata.RawDstAddr.String())
+		if err != nil {
+			return
+		}
+		uid, err := flowmeta.FindUID(metadata.NetWork.String(), source.Addr().String(), source.Port(), destination.Addr().String(), destination.Port())
+		if err != nil {
+			return
+		}
+		metadata.Uid = uint32(uid)
+	}
+	metadata.Process = flowPackages.Lookup(metadata.Uid)
+}

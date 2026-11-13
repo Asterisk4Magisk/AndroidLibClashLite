@@ -4,7 +4,9 @@
 package app
 
 import (
+	"cfa/native/flowmeta"
 	"net"
+	"net/netip"
 	"sync/atomic"
 	"syscall"
 
@@ -23,6 +25,13 @@ func MarkSocket(fd int) {
 }
 
 func QuerySocketUid(source, target net.Addr) int {
+	_, bridged := source.(interface{ FlowUID() uint32 })
+	if owner, ok := source.(interface{ FlowUID() uint32 }); ok && owner.FlowUID() != ^uint32(0) {
+		return int(owner.FlowUID())
+	}
+	if raw, ok := source.(interface{ RawAddr() net.Addr }); ok {
+		source = raw.RawAddr()
+	}
 	var protocol int
 
 	switch source.Network() {
@@ -35,6 +44,25 @@ func QuerySocketUid(source, target net.Addr) int {
 	}
 
 	if PlatformVersion() < 29 {
+		if bridged {
+			src, e := netip.ParseAddrPort(source.String())
+			if e != nil {
+				return -1
+			}
+			dst, e := netip.ParseAddrPort(target.String())
+			if e != nil {
+				return -1
+			}
+			network := "tcp"
+			if protocol == syscall.IPPROTO_UDP {
+				network = "udp"
+			}
+			uid, e := flowmeta.FindUID(network, src.Addr().String(), src.Port(), dst.Addr().String(), dst.Port())
+			if e != nil {
+				return -1
+			}
+			return uid
+		}
 		return platform.QuerySocketUidFromProcFs(source, target)
 	}
 

@@ -1,0 +1,89 @@
+// Copyright 2026, Asterisk4Magisk contributors
+// SPDX-License-Identifier: LGPL-3.0
+
+package socks
+
+import (
+	"net"
+	"net/netip"
+	"slices"
+	"time"
+
+	"cfa/native/flowmeta"
+	"github.com/metacubex/mihomo/adapter/inbound"
+	"github.com/metacubex/mihomo/common/pool"
+	"github.com/metacubex/mihomo/component/auth"
+	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/transport/socks5"
+)
+
+const FlowHeaderByte = '\r'
+
+func flowVerifier(store auth.AuthStore) func(string) bool {
+	return func(token string) bool {
+		a := store.Authenticator()
+		return a != nil && slices.Contains(a.Users(), flowmeta.Username) && a.Verify(flowmeta.Username, token)
+	}
+}
+
+// HandleFlow is enabled only by the reserved account on a private loopback inbound.
+func HandleFlow(conn net.Conn, tunnel C.Tunnel, store auth.AuthStore, additions ...inbound.Addition) {
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	h, err := flowmeta.ReadAuth(conn, flowVerifier(store))
+	if err != nil {
+		_ = conn.Close()
+		return
+	}
+	_ = conn.SetReadDeadline(time.Time{})
+	_, metadata := inbound.NewSocket(socks5.ParseAddr(h.Destination.String()), conn, C.SOCKS5, additions...)
+	metadata.SrcIP, metadata.SrcPort = h.Source.Addr(), h.Source.Port()
+	metadata.RawSrcAddr = flowmeta.OwnerAddr{Addr: h.Addr(true), UID: h.UID}
+	metadata.RawDstAddr = h.Addr(false)
+	tunnel.HandleTCPConn(conn, metadata)
+}
+
+type flowPacket struct {
+	*packet
+	header flowmeta.Header
+	token  string
+}
+
+func (p *flowPacket) LocalAddr() net.Addr {
+	return flowmeta.OwnerAddr{Addr: p.header.Addr(true), UID: p.header.UID}
+}
+
+func (p *flowPacket) WriteBack(b []byte, remote net.Addr) (int, error) {
+	var source netip.AddrPort
+	if address, ok := remote.(*net.UDPAddr); ok {
+		source = address.AddrPort()
+	} else {
+		var err error
+		source, err = netip.ParseAddrPort(remote.String())
+		if err != nil {
+			return 0, err
+		}
+	}
+	packet := pool.Get(flowmeta.MaxHeader + len(b))
+	defer pool.Put(packet)
+	n, err := p.header.Reverse(source).MarshalTo(packet, p.token)
+	if err != nil {
+		return 0, err
+	}
+	copy(packet[n:], b)
+	if _, err = p.pc.WriteTo(packet[:n+len(b)], p.rAddr); err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
+func handleFlowUDP(pc net.PacketConn, tunnel C.Tunnel, b []byte, put func(), remote net.Addr, store auth.AuthStore, additions ...inbound.Addition) {
+	h, n, token, err := flowmeta.ParseAuth(b, true, flowVerifier(store))
+	if err != nil {
+		if put != nil {
+			put()
+		}
+		return
+	}
+	p := &flowPacket{packet: &packet{pc: pc, rAddr: remote, payload: b[n:], put: put}, header: h, token: token}
+	tunnel.HandleUDPPacket(inbound.NewPacket(socks5.ParseAddr(h.Destination.String()), p, C.SOCKS5, additions...))
+}

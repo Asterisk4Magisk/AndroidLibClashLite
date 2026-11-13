@@ -28,6 +28,7 @@ struct Session {
     home: String,
     base: String,
     unix_controller: Option<UnixController>,
+    flow_tokens: std::collections::HashMap<String, String>,
 }
 
 struct UnixController {
@@ -133,6 +134,10 @@ fn start_inner(
         bail!("home and baseDirectory must be absolute paths");
     }
     let (raw, settings, controller_unix) = parse(bytes)?;
+    #[cfg(unix)]
+    let flow_tokens = crate::flowmeta::tokens(bytes)?;
+    #[cfg(not(unix))]
+    let flow_tokens = std::collections::HashMap::new();
     std::fs::create_dir_all(home)?;
     meow_common::set_home_dir(PathBuf::from(home));
     meow_config::set_offline_validate(false);
@@ -141,8 +146,15 @@ fn start_inner(
     let result = crate::get_runtime().block_on(async {
         let config = meow_config::build_config(raw, Some(Path::new(base))).await?;
         meow_api::ensure_listeners_supported(&config.listeners.named, crate::listeners::supported)?;
-        let mut session =
-            start_config(config, config_path, settings, reload_state, controller_unix).await?;
+        let mut session = start_config(
+            config,
+            config_path,
+            settings,
+            reload_state,
+            controller_unix,
+            flow_tokens,
+        )
+        .await?;
         session.home = home.into();
         session.base = base.into();
         *SESSION.lock() = Some(session);
@@ -160,6 +172,7 @@ async fn start_config(
     settings: crate::autoswitch::Settings,
     reload_state: Option<crate::autoswitch::ReloadState>,
     controller_unix: Option<String>,
+    flow_tokens: std::collections::HashMap<String, String>,
 ) -> Result<Session> {
     meow_common::set_host_resolver(Arc::new(
         meow_dns::ResolverHostHook::new_with_proxy_resolver(
@@ -215,6 +228,12 @@ async fn start_config(
     let sniffer = Arc::new(SnifferRuntime::new(config.sniffer));
     let mut named = config.listeners.named;
     for listener in &mut named {
+        #[cfg(unix)]
+        if let Some(token) = flow_tokens.get(&listener.name) {
+            let address = std::net::SocketAddr::new(listener.listen.parse()?, listener.port);
+            crate::flowmeta::start(tunnel.clone(), address, token.clone()).await?;
+            continue;
+        }
         crate::listeners::start(
             listener,
             &tunnel,
@@ -282,6 +301,7 @@ async fn start_config(
         home: String::new(),
         base: String::new(),
         unix_controller,
+        flow_tokens,
     })
 }
 
@@ -299,6 +319,21 @@ pub fn reload(
         .as_ref()
         .map(|session| -> Result<_> {
             let mut raw = serde_yaml::to_value(&*session.app.raw_config.read())?;
+            // Named-listener deserialization ignores the private account. Preserve it
+            // when rebuilding the rollback configuration after a failed reload.
+            if let Some(listeners) = raw.get_mut("listeners").and_then(|v| v.as_sequence_mut()) {
+                for listener in listeners {
+                    let token = listener
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .and_then(|name| session.flow_tokens.get(name));
+                    if let Some(token) = token {
+                        listener["users"] = serde_yaml::to_value(vec![serde_json::json!({
+                            "username": "__asterisk_flow_v1", "password": token
+                        })])?;
+                    }
+                }
+            }
             if let Some(controller) = &session.unix_controller {
                 raw["external-controller-unix"] = controller.path.clone().into();
             }

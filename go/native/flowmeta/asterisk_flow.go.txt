@@ -1,0 +1,21 @@
+// Copyright 2026, Asterisk4Magisk contributors
+// SPDX-License-Identifier: LGPL-3.0
+
+package process
+
+import C "github.com/metacubex/mihomo/constant"
+
+var flowOwnerResolver func(*C.Metadata)
+
+// Bridge ownership must never fall through to a lookup of the relay socket.
+func AsteriskFlowOwner(metadata *C.Metadata) bool {
+	owner, ok := metadata.RawSrcAddr.(interface{ FlowUID() uint32 })
+	if !ok {
+		return false
+	}
+	metadata.Uid = owner.FlowUID()
+	if flowOwnerResolver != nil {
+		flowOwnerResolver(metadata)
+	}
+	return true
+}

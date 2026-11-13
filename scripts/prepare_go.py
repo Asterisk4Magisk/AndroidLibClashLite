@@ -40,6 +40,18 @@ def prepare_sources(repo, work, core):
         text = patches.get(name, (core / name).read_text(encoding='utf-8'))
         patches[name] = replace_once(text, old, new)
 
+    patch('listener/socks/tcp.go', '\tcase socks5.Version:\n',
+          '\tcase FlowHeaderByte:\n\t\tHandleFlow(bufConn, tunnel, store, additions...)\n\tcase socks5.Version:\n')
+    patch('listener/mixed/mixed.go', '\tcase socks5.Version:\n',
+          '\tcase socks.FlowHeaderByte:\n\t\tsocks.HandleFlow(bufConn, tunnel, store, additions...)\n\tcase socks5.Version:\n')
+    patch('listener/socks/udp.go', '\t\t\thandleSocksUDP(l, tunnel, data, put, remoteAddr, additions...)',
+          '\t\t\tif len(data) > 0 && data[0] == FlowHeaderByte {\n'
+          '\t\t\t\thandleFlowUDP(l, tunnel, data, put, remoteAddr, config.AuthStore, additions...)\n'
+          '\t\t\t} else { handleSocksUDP(l, tunnel, data, put, remoteAddr, additions...) }')
+
+    patch('tunnel/tunnel.go', '\t\t\t\tattemptProcessLookup = false\n',
+          '\t\t\t\tattemptProcessLookup = false\n'
+          '\t\t\t\tif process.AsteriskFlowOwner(metadata) {\n\t\t\t\t\treturn\n\t\t\t\t}\n')
     # Manual JNI/API group tests use the caller's URL. Background health checks
     # and automatic selection keep the group's configured testUrl.
     patch('adapter/outboundgroup/urltest.go',
@@ -154,6 +166,17 @@ def prepare_sources(repo, work, core):
     replacement.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(repo / 'native/profilecache/cachefile_reset.go.txt', replacement)
     replacements[str(cache_reset)] = str(replacement)
+    flow_inbound = core / 'listener/socks/asterisk_flow.go'
+    replacement = work / 'overlay/listener/socks/asterisk_flow.go'
+    replacement.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(repo / 'native/flowmeta/mihomo.go.txt', replacement)
+    replacements[str(flow_inbound)] = str(replacement)
+    for filename in ('asterisk_flow.go', 'asterisk_flow_android.go'):
+        target = core / 'component/process' / filename
+        replacement = work / 'overlay/component/process' / filename
+        replacement.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(repo / 'native/flowmeta' / (filename + '.txt'), replacement)
+        replacements[str(target)] = str(replacement)
     overlay = work / 'overlay.json'
     overlay.write_text(json.dumps({'Replace': replacements}), encoding='utf-8')
     return source, overlay

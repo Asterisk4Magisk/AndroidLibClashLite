@@ -33,6 +33,12 @@ func Init(home, versionName string, platformVersion int) {
 		}
 
 		uid := app.QuerySocketUid(metadata.RawSrcAddr, metadata.RawDstAddr)
+		if uid < 0 {
+			return "", process.ErrNotFound
+		}
+		if uid >= 0 {
+			metadata.Uid = uint32(uid)
+		}
 		pkg := app.QueryAppByUid(uid)
 
 		log.Debugln("[PKG] %s --> %s by %d[%s]", metadata.SourceAddress(), metadata.RemoteAddress(), uid, pkg)
