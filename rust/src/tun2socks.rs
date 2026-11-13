@@ -412,6 +412,7 @@ async fn dispatch_tcp(stream: lwip::TcpStream, src_addr: SocketAddr, dst_addr: S
     tracing::debug!("tun2socks: dispatch {} -> {}", src_addr, dst_addr);
 
     let mut metadata = Metadata {
+        process_info_complete: true,
         network: Network::Tcp,
         conn_type: ConnType::Inner,
         src_ip: Some(src_addr.ip()),
@@ -420,10 +421,12 @@ async fn dispatch_tcp(stream: lwip::TcpStream, src_addr: SocketAddr, dst_addr: S
         dst_port: dst_addr.port(),
         ..Default::default()
     };
-    apply_owner(
-        &mut metadata,
-        owner::lookup(owner::IPPROTO_TCP, src_addr, dst_addr).await,
-    );
+    if owner::needs_owner(tunnel.inner()) {
+        apply_owner(
+            &mut metadata,
+            owner::lookup(owner::IPPROTO_TCP, src_addr, dst_addr).await,
+        );
+    }
 
     let proxy_conn: Box<dyn ProxyConn> = Box::new(NetstackConn(stream));
     let inner = tunnel.inner().clone();
@@ -494,6 +497,7 @@ pub(crate) async fn dispatch_udp(
     let inner = tunnel.inner();
 
     let mut metadata = Metadata {
+        process_info_complete: true,
         network: Network::Udp,
         conn_type: if inbound.is_some() {
             ConnType::Tun
@@ -534,7 +538,7 @@ pub(crate) async fn dispatch_udp(
 
     // Rules run once per flow, on the packet that opens its session; the
     // packets after it skip the owner lookup's binder round trip.
-    if !inner.nat_table.contains_key(&key) {
+    if !inner.nat_table.contains_key(&key) && owner::needs_owner(inner) {
         apply_owner(
             &mut metadata,
             owner::lookup_bridge(owner::IPPROTO_UDP, src, dst, supplied_uid).await,

@@ -28,6 +28,9 @@ Keep this ordering when adding or renumbering patches.
   REJECT, declared proxies, declared groups) independently of dependency build
   order. The primary outbound remains the default without moving it in the list;
   saved selections take precedence and removed selections fall back to the primary.
+- `0005-inbound-process-authority.patch`: lets an inbound finish owner lookup with
+  an unknown result or disable it by policy. Rule enrichment and the traffic
+  ledger respect that result instead of scanning the original socket again.
 
 Preparation checks every patch against the pinned sources before applying it.
 When updating the pin, review and regenerate these patches, then run the Android

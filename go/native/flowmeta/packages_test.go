@@ -7,18 +7,31 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestPackageCacheRefreshesAndKeepsFullUID(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "packages.list")
 	cache := PackageCache{Path: path}
+	defer cache.Close()
+	wait := func(want string) {
+		t.Helper()
+		deadline := time.Now().Add(time.Second)
+		for cache.Lookup(1012345) != want {
+			if time.Now().After(deadline) {
+				t.Fatalf("package snapshot did not become %q", want)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
 	if cache.Lookup(1012345) != "" {
 		t.Fatal("missing file returned a package")
 	}
 	if err := os.WriteFile(path, []byte("first 12345 extra\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if cache.Lookup(1012345) != "first" || cache.Lookup(112345) != "first" {
+	wait("first")
+	if cache.Lookup(112345) != "first" {
 		t.Fatal("multi-user app ID lost")
 	}
 	info, _ := os.Stat(path)
@@ -30,11 +43,7 @@ func TestPackageCacheRefreshesAndKeepsFullUID(t *testing.T) {
 	if err := os.Rename(replacement, path); err != nil {
 		t.Fatal(err)
 	}
-	if cache.Lookup(1012345) != "other" {
-		t.Fatal("same-size atomic replacement was not detected")
-	}
+	wait("other")
 	_ = os.Remove(path)
-	if cache.Lookup(1012345) != "" {
-		t.Fatal("removed package snapshot remained cached")
-	}
+	wait("")
 }

@@ -9,10 +9,18 @@ use jni::{
 use parking_lot::RwLock;
 use std::{net::SocketAddr, sync::Arc};
 
+mod demand;
 #[cfg(unix)]
 mod packages;
 #[cfg(unix)]
 mod socket_owner;
+
+pub(crate) fn configure_process_mode(mode: &str) {
+    demand::configure(mode);
+}
+pub(crate) fn needs_owner(inner: &meow_tunnel::tunnel::TunnelInner) -> bool {
+    demand::needed(inner)
+}
 
 struct Callbacks {
     vm: JavaVM,
@@ -84,6 +92,9 @@ pub async fn lookup_bridge(
         return lookup(protocol, source, destination).await;
     }
     if let Some(uid) = uid {
+        if let Some(package) = packages::cached(uid) {
+            return Some(Owner { uid, package });
+        }
         let package = if unsafe { libc::geteuid() } == 0 {
             tokio::task::spawn_blocking(move || packages::lookup(uid))
                 .await
@@ -121,10 +132,25 @@ impl Callbacks {
     fn owner(&self, protocol: i32, source: SocketAddr, destination: SocketAddr) -> Result<Owner> {
         let mut env = self.vm.attach_current_thread()?;
         let result = env.with_local_frame(8, |env| -> Result<Owner> {
+            #[cfg(target_os = "android")]
+            let legacy_uid = if socket_owner::uses_legacy_procfs() {
+                anyhow::ensure!(is_local_source(source.ip()), "source is not local");
+                Some(
+                    socket_owner::lookup(protocol == IPPROTO_UDP, source, destination)
+                        .and_then(|uid| i32::try_from(uid).ok())
+                        .context("legacy connection owner unknown")?,
+                )
+            } else {
+                None
+            };
+            #[cfg(not(target_os = "android"))]
+            let legacy_uid: Option<i32> = None;
             let source = JObject::from(env.new_string(source.to_string())?);
             let destination = JObject::from(env.new_string(destination.to_string())?);
-            let uid = env
-                .call_method(
+            let uid = if let Some(uid) = legacy_uid {
+                uid
+            } else {
+                env.call_method(
                     &self.object,
                     "querySocketUid",
                     "(ILjava/lang/String;Ljava/lang/String;)I",
@@ -134,7 +160,8 @@ impl Callbacks {
                         JValue::Object(&destination),
                     ],
                 )?
-                .i()?;
+                .i()?
+            };
             let numeric_uid = u32::try_from(uid).context("connection owner unknown")?;
             let package = env
                 .call_method(

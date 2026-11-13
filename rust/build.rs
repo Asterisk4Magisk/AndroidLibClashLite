@@ -2,6 +2,16 @@
 // SPDX-License-Identifier: LGPL-3.0
 
 fn main() {
+    println!("cargo:rerun-if-changed=native/socket_owner.c");
+    println!("cargo:rerun-if-changed=../go/native/flowmeta/owner_diag.h");
+    if matches!(
+        std::env::var("CARGO_CFG_TARGET_OS").as_deref(),
+        Ok("android" | "linux")
+    ) {
+        cc::Build::new()
+            .file("native/socket_owner.c")
+            .compile("asterisk_socket_owner");
+    }
     println!("cargo:rerun-if-changed=upstream.json");
     let pin: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string("upstream.json").unwrap()).unwrap();

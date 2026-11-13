@@ -134,6 +134,12 @@ fn start_inner(
         bail!("home and baseDirectory must be absolute paths");
     }
     let (raw, settings, controller_unix) = parse(bytes)?;
+    let (profile, _) = crate::profile::decode_core(bytes)?;
+    let process_mode = profile
+        .get("find-process-mode")
+        .and_then(|value| value.as_str())
+        .unwrap_or("strict")
+        .to_owned();
     #[cfg(unix)]
     let flow_tokens = crate::flowmeta::tokens(bytes)?;
     #[cfg(not(unix))]
@@ -146,6 +152,7 @@ fn start_inner(
     let result = crate::get_runtime().block_on(async {
         let config = meow_config::build_config(raw, Some(Path::new(base))).await?;
         meow_api::ensure_listeners_supported(&config.listeners.named, crate::listeners::supported)?;
+        crate::platform::configure_process_mode(&process_mode);
         let mut session = start_config(
             config,
             config_path,

@@ -18,8 +18,8 @@ import (
 
 var errAmbiguousOwner = errors.New("ambiguous socket owner")
 
-// FindUID uses the original tuple. Android 8/9 permit this read; newer VPNs use
-// the platform callback, and the standalone ROOT launcher uses this fallback.
+// FindUID selects procfs only on Android before API 29. Newer systems use
+// socket diagnostics and return its errors without retrying through procfs.
 func FindUID(network, source string, sourcePort uint16, destination string, destinationPort uint16) (int, error) {
 	if network != "tcp" && network != "udp" {
 		return -1, errors.New("invalid network")
@@ -37,9 +37,18 @@ func FindUID(network, source string, sourcePort uint16, destination string, dest
 	if !localSource(src) {
 		return -1, errors.New("source is not local")
 	}
-	return findUIDInTables(network, netip.AddrPortFrom(src.Unmap(), sourcePort), netip.AddrPortFrom(dst.Unmap(), destinationPort), func(path string) (io.ReadCloser, error) {
-		return os.Open(path)
-	})
+	sourceAddr := netip.AddrPortFrom(src.Unmap(), sourcePort)
+	destinationAddr := netip.AddrPortFrom(dst.Unmap(), destinationPort)
+	if androidAPILevel > 0 && androidAPILevel < 29 {
+		return findUIDInTables(network, sourceAddr, destinationAddr, func(path string) (io.ReadCloser, error) {
+			return os.Open(path)
+		})
+	}
+	uid, _, err := FindSocket(network, sourceAddr, destinationAddr)
+	if err != nil {
+		return -1, err
+	}
+	return int(uid), nil
 }
 
 func findUIDInTables(network string, source, destination netip.AddrPort, open func(string) (io.ReadCloser, error)) (int, error) {

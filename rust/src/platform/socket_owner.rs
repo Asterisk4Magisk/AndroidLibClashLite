@@ -6,9 +6,62 @@ use std::{
     net::{IpAddr, SocketAddr},
 };
 
-// Called only for a local source on the standalone ROOT path. Never attribute
-// a bridge's own socket or an ambiguous SO_REUSEPORT group to an application.
+// Standalone ownership and the pre-API-29 VPN compatibility path. The caller
+// checks that the source is local; an ambiguous group has no authoritative UID.
 pub(super) fn lookup(udp: bool, source: SocketAddr, destination: SocketAddr) -> Option<u32> {
+    if uses_legacy_procfs() {
+        return lookup_procfs(udp, source, destination);
+    }
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    {
+        unsafe extern "C" {
+            fn asterisk_socket_owner(
+                udp: i32,
+                source: *const u8,
+                source_port: u16,
+                destination: *const u8,
+                destination_port: u16,
+                uid: *mut u32,
+            ) -> i32;
+        }
+        let address = |ip: IpAddr| match ip {
+            IpAddr::V4(ip) => ip.to_ipv6_mapped().octets(),
+            IpAddr::V6(ip) => ip.octets(),
+        };
+        let src = address(source.ip());
+        let dst = address(destination.ip());
+        let mut uid = 0;
+        let result = unsafe {
+            asterisk_socket_owner(
+                i32::from(udp),
+                src.as_ptr(),
+                source.port(),
+                dst.as_ptr(),
+                destination.port(),
+                &mut uid,
+            )
+        };
+        (result == 0).then_some(uid)
+    }
+    #[cfg(not(any(target_os = "android", target_os = "linux")))]
+    None
+}
+
+pub(super) fn uses_legacy_procfs() -> bool {
+    #[cfg(target_os = "android")]
+    {
+        unsafe extern "C" {
+            fn asterisk_android_api_level() -> i32;
+        }
+        static API_LEVEL: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+        let api = *API_LEVEL.get_or_init(|| unsafe { asterisk_android_api_level() });
+        api > 0 && api < 29
+    }
+    #[cfg(not(target_os = "android"))]
+    false
+}
+
+fn lookup_procfs(udp: bool, source: SocketAddr, destination: SocketAddr) -> Option<u32> {
     let network = if udp { "udp" } else { "tcp" };
     let mut owner = None;
     for suffix in ["", "6"] {

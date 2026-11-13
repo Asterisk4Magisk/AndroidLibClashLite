@@ -70,6 +70,7 @@ pub async fn start(tunnel: Tunnel, address: SocketAddr, token: String) -> Result
                     return;
                 };
                 let mut metadata = Metadata {
+                    process_info_complete: true,
                     network: Network::Tcp,
                     conn_type: ConnType::Tun,
                     in_name: "asterisk-bridge".into(),
@@ -80,16 +81,18 @@ pub async fn start(tunnel: Tunnel, address: SocketAddr, token: String) -> Result
                     dst_port: h.destination.port(),
                     ..Default::default()
                 };
-                crate::tun2socks::apply_owner(
-                    &mut metadata,
-                    crate::platform::lookup_bridge(
-                        crate::platform::IPPROTO_TCP,
-                        h.source,
-                        h.destination,
-                        h.uid,
-                    )
-                    .await,
-                );
+                if crate::platform::needs_owner(tunnel.inner()) {
+                    crate::tun2socks::apply_owner(
+                        &mut metadata,
+                        crate::platform::lookup_bridge(
+                            crate::platform::IPPROTO_TCP,
+                            h.source,
+                            h.destination,
+                            h.uid,
+                        )
+                        .await,
+                    );
+                }
                 meow_tunnel::tcp::handle_tcp(tunnel.inner(), Box::new(stream), metadata).await;
             });
         }
