@@ -1,0 +1,69 @@
+--- a/crates/meow-listener/src/lib.rs
++++ b/crates/meow-listener/src/lib.rs
+@@ -4,6 +4,9 @@
+ //! inbound (feature `listener-tun`).
+ 
+ pub mod sniffer;
++
++#[cfg(feature = "listener-http")]
++pub mod process;
+ 
+ // Inbound-socket TCP keepalive applied at accept time — compiled only when
+ // at least one TCP listener that calls it is enabled (a listener-less
+--- /dev/null
++++ b/crates/meow-listener/src/process.rs
+@@ -0,0 +1,34 @@
++//! Optional process attribution supplied by an embedded runtime.
++use meow_common::{process_lookup::ProcessInfo, Metadata};
++use meow_tunnel::tunnel::TunnelInner;
++use parking_lot::RwLock;
++use std::{future::Future, net::SocketAddr, pin::Pin};
++
++pub type ProcessLookupFuture = Pin<Box<dyn Future<Output = Option<ProcessInfo>> + Send>>;
++pub type TcpProcessLookup = fn(&TunnelInner, SocketAddr, SocketAddr) -> ProcessLookupFuture;
++
++static TCP_PROCESS_LOOKUP: RwLock<Option<TcpProcessLookup>> = RwLock::new(None);
++
++/// Install or remove the embedder's lookup for accepted proxy sockets.
++pub fn set_tcp_process_lookup(lookup: Option<TcpProcessLookup>) {
++    *TCP_PROCESS_LOOKUP.write() = lookup;
++}
++
++pub(crate) async fn enrich_tcp_process(
++    inner: &TunnelInner,
++    metadata: &mut Metadata,
++    source: SocketAddr,
++    destination: SocketAddr,
++) {
++    let lookup = *TCP_PROCESS_LOOKUP.read();
++    let Some(lookup) = lookup else {
++        return;
++    };
++    // Unknown and deliberately disabled results are authoritative too.
++    metadata.process_info_complete = true;
++    if let Some(info) = lookup(inner, source, destination).await {
++        metadata.process = info.name.into();
++        metadata.process_path = info.path.into();
++        metadata.uid = info.uid;
++    }
++}
+--- a/crates/meow-listener/src/http_proxy.rs
++++ b/crates/meow-listener/src/http_proxy.rs
+@@ -210,6 +210,8 @@
+         // 200 OK (RFC 7230 forbids this but real clients do it); the shared
+         // path re-emits them to the remote before the bidirectional copy.
+         let inner = tunnel.inner();
++        crate::process::enrich_tcp_process(inner, &mut metadata, src_addr, stream.local_addr()?)
++            .await;
+         route_inbound_tcp(inner, stream, metadata, &leftover).await;
+     } else {
+         // Plain HTTP proxy (GET/POST/etc via proxy)
+@@ -266,6 +268,8 @@
+         debug!("HTTP {} to {}:{}", method, host, port);
+ 
+         let inner = tunnel.inner();
++        crate::process::enrich_tcp_process(inner, &mut metadata, src_addr, stream.local_addr()?)
++            .await;
+         if matches!(
+             inner.pre_handle_metadata(&mut metadata),
+             meow_tunnel::PreHandleVerdict::Drop

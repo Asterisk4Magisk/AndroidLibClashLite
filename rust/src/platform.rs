@@ -40,10 +40,12 @@ pub fn install(env: &mut JNIEnv, object: &JObject) -> Result<()> {
     #[cfg(target_os = "android")]
     meow_common::set_socket_protector(callbacks.clone());
     *CALLBACKS.write() = Some(callbacks);
+    meow_listener::process::set_tcp_process_lookup(Some(lookup_proxy_process));
     Ok(())
 }
 
 pub fn clear() {
+    meow_listener::process::set_tcp_process_lookup(None);
     #[cfg(target_os = "android")]
     meow_common::clear_socket_protector();
     *CALLBACKS.write() = None;
@@ -126,6 +128,25 @@ pub async fn lookup(protocol: i32, source: SocketAddr, destination: SocketAddr) 
         .await
         .ok()
         .flatten()
+}
+
+fn lookup_proxy_process(
+    inner: &meow_tunnel::tunnel::TunnelInner,
+    source: SocketAddr,
+    destination: SocketAddr,
+) -> meow_listener::process::ProcessLookupFuture {
+    let needed = needs_owner(inner);
+    Box::pin(async move {
+        if !needed {
+            return None;
+        }
+        let owner = lookup(IPPROTO_TCP, source, destination).await?;
+        Some(meow_common::process_lookup::ProcessInfo {
+            name: owner.package.as_deref().unwrap_or_default().to_owned(),
+            path: String::new(),
+            uid: Some(owner.uid),
+        })
+    })
 }
 
 impl Callbacks {

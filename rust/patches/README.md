@@ -31,6 +31,9 @@ Keep this ordering when adding or renumbering patches.
 - `0005-inbound-process-authority.patch`: lets an inbound finish owner lookup with
   an unknown result or disable it by policy. Rule enrichment and the traffic
   ledger respect that result instead of scanning the original socket again.
+- `0006-http-process-lookup.patch`: lets the Android embedder attribute plain HTTP
+  and CONNECT connections using the accepted socket's original endpoints. The
+  existing lookup policy and authoritative unknown results also apply here.
 
 Preparation checks every patch against the pinned sources before applying it.
 When updating the pin, review and regenerate these patches, then run the Android
