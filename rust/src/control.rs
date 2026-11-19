@@ -3,6 +3,7 @@
 
 //! Binding-owned configuration and routes around the unchanged meow router.
 use crate::autoswitch::{Service, Settings};
+use crate::proxy_ip_probe::{self, ReloadGuard, RuntimeState};
 use anyhow::{Context, Result};
 use axum::{
     body::{to_bytes, Body},
@@ -14,8 +15,13 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use meow_api::routes::AppState;
-use std::{io::Write, path::Path, sync::Arc};
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use subtle::ConstantTimeEq;
+use tokio::sync::watch;
 
 #[derive(Clone)]
 struct Extension {
@@ -23,12 +29,16 @@ struct Extension {
     autoswitch: Arc<Service>,
     startup: Arc<meow_config::raw::RawConfig>,
     controller_unix: Option<String>,
+    probe_runtime: watch::Sender<RuntimeState>,
+    probe_home: PathBuf,
 }
 
 pub fn router(
     app: Arc<AppState>,
     autoswitch: Arc<Service>,
     controller_unix: Option<String>,
+    probe_runtime: watch::Sender<RuntimeState>,
+    probe_home: PathBuf,
 ) -> Router {
     let startup = Arc::new(app.raw_config.read().clone());
     meow_api::routes::create_router(app.clone())
@@ -38,6 +48,8 @@ pub fn router(
                 autoswitch,
                 startup,
                 controller_unix,
+                probe_runtime,
+                probe_home,
             },
             extend,
         ))
@@ -110,13 +122,24 @@ async fn extend(State(extension): State<Extension>, mut request: Request, next: 
     let method = request.method().clone();
     let custom = path == "/asterisk/auto-switch";
     let capabilities = path == "/asterisk/capabilities";
+    let probe = path == "/asterisk/proxy-ip-probe";
     let reload = path == "/configs" && method == Method::PUT;
     let save = path == "/api/config/save" && method == Method::POST;
     let memory =
         path == "/memory" && method == Method::GET && !request.headers().contains_key("upgrade");
-    if (custom || capabilities || reload || save || memory) && !authorized(&request, &extension.app)
+    if (custom || capabilities || probe || reload || save || memory)
+        && !authorized(&request, &extension.app)
     {
         return error(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
+    if probe {
+        return proxy_ip_probe::handle(
+            request,
+            &extension.app,
+            &extension.probe_home,
+            extension.probe_runtime.subscribe(),
+        )
+        .await;
     }
     if memory {
         // Upstream's process-global feed can outlive this binding's disposable
@@ -250,6 +273,9 @@ async fn extend(State(extension): State<Extension>, mut request: Request, next: 
             Err(e) => return error(StatusCode::BAD_REQUEST, e),
         }
     }
+    let _probe_reload = configured
+        .as_ref()
+        .map(|_| ReloadGuard::new(&extension.probe_runtime));
     let response = next.run(request).await;
     if response.status().is_success() {
         if path == "/connections" && method == Method::DELETE {

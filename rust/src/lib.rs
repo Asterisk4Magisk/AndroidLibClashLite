@@ -16,6 +16,7 @@ mod logging;
 mod network_tests;
 mod platform;
 mod profile;
+mod proxy_ip_probe;
 mod systemdns;
 #[cfg(test)]
 mod tests;

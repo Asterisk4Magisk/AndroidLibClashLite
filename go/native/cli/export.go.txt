@@ -15,6 +15,7 @@ import (
 	_ "cfa/environment"
 	_ "cfa/native/autoswitch/api"
 	_ "cfa/native/capabilities/api"
+	_ "cfa/native/proxyip/api"
 	"cfa/native/systemdns"
 )
 

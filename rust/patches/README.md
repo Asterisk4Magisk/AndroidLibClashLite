@@ -34,6 +34,8 @@ Keep this ordering when adding or renumbering patches.
 - `0006-http-process-lookup.patch`: lets the Android embedder attribute plain HTTP
   and CONNECT connections using the accepted socket's original endpoints. The
   existing lookup policy and authoritative unknown results also apply here.
+- `0007-proxy-ip-read-only.patch` lets exit-IP probes use the existing group
+  selection logic without updating group usage, selection, or health state.
 
 Preparation checks every patch against the pinned sources before applying it.
 When updating the pin, review and regenerate these patches, then run the Android

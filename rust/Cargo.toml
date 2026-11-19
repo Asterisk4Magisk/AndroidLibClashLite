@@ -16,6 +16,7 @@ meow-dns = { path = ".upstream/meow/crates/meow-dns", features = ["dns-server", 
 meow-api = { path = ".upstream/meow/crates/meow-api" }
 meow-tunnel = { path = ".upstream/meow/crates/meow-tunnel" }
 meow-proxy = { path = ".upstream/meow/crates/meow-proxy" }
+meow-transport = { path = ".upstream/meow/crates/meow-transport", features = ["tls"] }
 meow-listener = { path = ".upstream/meow/crates/meow-listener", features = ["listener-mixed", "listener-http", "listener-socks5"] }
 lwip = { package = "meow-lwip", path = ".upstream/meow/crates/meow-lwip" }
 anyhow = "1"
@@ -25,6 +26,9 @@ fancy-regex = "0.16"
 axum = { version = "0.8", features = ["ws"] }
 dashmap = "6"
 futures = "0.3"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 jni = "0.21"
 libc = "0.2"
 parking_lot = "0.12"

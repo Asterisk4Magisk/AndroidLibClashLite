@@ -1,0 +1,181 @@
+diff --git a/crates/meow-proxy/src/group/mod.rs b/crates/meow-proxy/src/group/mod.rs
+--- a/crates/meow-proxy/src/group/mod.rs
++++ b/crates/meow-proxy/src/group/mod.rs
+@@ -17,6 +17,29 @@
+ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+ use tracing::{debug, info};
+ 
++tokio::task_local! {
++    static READ_ONLY_PROBE: ();
++}
++
++/// Runs a diagnostic using the group's normal candidate selection without committing group state.
++pub async fn with_read_only_probe<T>(dial: impl Future<Output = T>) -> T {
++    READ_ONLY_PROBE.scope((), dial).await
++}
++
++pub(crate) fn read_only_probe() -> bool {
++    READ_ONLY_PROBE.try_with(|_| ()).is_ok()
++}
++
++pub(crate) const PROBE_BLOCKED: &str = "blocked by proxy IP probe outbound";
++
++pub fn probe_blocked(error: &MeowError) -> bool {
++    match error {
++        MeowError::Other(message) => message == PROBE_BLOCKED,
++        MeowError::RelayHopFailed { source, .. } => probe_blocked(source),
++        _ => false,
++    }
++}
++
+ /// Lock-free traffic-use generation shared by automatic proxy groups. A lazy
+ /// health-check loop remembers the last generation it probed and sleeps until
+ /// another dial increments this counter.
+@@ -41,7 +64,7 @@
+     /// probes or a background refresh would mark a lazy child as used and
+     /// keep its own probe loop awake forever without any real traffic.
+     pub(super) fn touch_user_traffic(&self, metadata: &Metadata) {
+-        if metadata.is_internal() {
++        if metadata.is_internal() || read_only_probe() {
+             return;
+         }
+         self.touch();
+@@ -352,6 +375,7 @@
+     tracker: &'a DialFailureTracker,
+     member: &'a Arc<dyn Proxy>,
+     deadline: Option<tokio::time::Instant>,
++    count_outcome: bool,
+ }
+ 
+ impl<'a> DialAttempt<'a> {
+@@ -365,6 +389,7 @@
+             tracker,
+             member,
+             deadline: meow_common::dial::dial_deadline(),
++            count_outcome: !read_only_probe(),
+         }
+     }
+ 
+@@ -390,6 +415,9 @@
+             })
+             .await;
+         self.deadline = None;
++        if !self.count_outcome {
++            return result;
++        }
+         match &result {
+             Ok(_) => self.tracker.on_success(),
+             Err(err) if front_failed => debug!(
+@@ -412,9 +440,10 @@
+ 
+ impl Drop for DialAttempt<'_> {
+     fn drop(&mut self) {
+-        if self
+-            .deadline
+-            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
++        if self.count_outcome
++            && self
++                .deadline
++                .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+         {
+             let err = MeowError::Io(std::io::Error::new(
+                 std::io::ErrorKind::TimedOut,
+@@ -437,7 +466,7 @@
+     dial: bool,
+ ) -> Option<ChainTarget> {
+     let hop = crate::dialer::front_hop_for(metadata)?;
+-    if dial {
++    if dial && !read_only_probe() {
+         if let Some(owner) = &hop.owner {
+             health.note_owner(&hop.target, owner);
+         }
+@@ -528,7 +557,7 @@
+     target: ChainTarget,
+     member: &Arc<dyn Proxy>,
+ ) -> Box<dyn ProxyConn> {
+-    if member.chain_health().is_some() {
++    if read_only_probe() || member.chain_health().is_some() {
+         return conn;
+     }
+     let carrier = health.carrier(&target).as_deref() == Some(member.name());
+diff --git a/crates/meow-proxy/src/group/fallback.rs b/crates/meow-proxy/src/group/fallback.rs
+--- a/crates/meow-proxy/src/group/fallback.rs
++++ b/crates/meow-proxy/src/group/fallback.rs
+@@ -120,7 +120,9 @@
+             }
+             // Upstream clears a stale fallback pin in memory when it is
+             // observed dead, but leaves the persistent cache untouched.
+-            *self.fixed.write() = None;
++            if !super::read_only_probe() {
++                *self.fixed.write() = None;
++            }
+         }
+         let mut fallback: Option<Arc<dyn Proxy>> = None;
+         for p in &self.static_proxies {
+diff --git a/crates/meow-proxy/src/group/urltest.rs b/crates/meow-proxy/src/group/urltest.rs
+--- a/crates/meow-proxy/src/group/urltest.rs
++++ b/crates/meow-proxy/src/group/urltest.rs
+@@ -187,12 +187,16 @@
+ 
+         if let Some(bp) = best_proxy.as_ref() {
+             if best_delay.saturating_add(self.tolerance) < current_delay || !current_alive {
+-                *self.fastest.write() = Some(SmolStr::from(bp.name()));
++                if !super::read_only_probe() {
++                    *self.fastest.write() = Some(SmolStr::from(bp.name()));
++                }
+                 return Some(Arc::clone(bp));
+             }
+         } else if !current_alive {
+             let fb = first_any.clone();
+-            *self.fastest.write() = fb.as_ref().map(|p| SmolStr::from(p.name()));
++            if !super::read_only_probe() {
++                *self.fastest.write() = fb.as_ref().map(|p| SmolStr::from(p.name()));
++            }
+             return fb;
+         }
+         current_proxy.or(best_proxy).or(first_any)
+diff --git a/crates/meow-proxy/src/group/load_balance.rs b/crates/meow-proxy/src/group/load_balance.rs
+--- a/crates/meow-proxy/src/group/load_balance.rs
++++ b/crates/meow-proxy/src/group/load_balance.rs
+@@ -232,7 +232,7 @@
+                 // `advance=false` is the match-time peek (`Unwrap(metadata,
+                 // false)` upstream): round-robin reads the counter without
+                 // committing it.
+-                let c = if advance {
++                let c = if advance && !super::read_only_probe() {
+                     self.counter.fetch_add(1, Ordering::Relaxed)
+                 } else {
+                     self.counter.load(Ordering::Relaxed)
+diff --git a/crates/meow-proxy/src/reject.rs b/crates/meow-proxy/src/reject.rs
+--- a/crates/meow-proxy/src/reject.rs
++++ b/crates/meow-proxy/src/reject.rs
+@@ -130,6 +130,14 @@
+     }
+ 
+     async fn dial_tcp(&self, _metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
++        if crate::group::read_only_probe()
++            && matches!(
++                self.adapter_type,
++                AdapterType::Reject | AdapterType::RejectDrop
++            )
++        {
++            return Err(MeowError::Other(crate::group::PROBE_BLOCKED.into()));
++        }
+         if self.drop {
+             // Sleep for a long time to simulate DROP behavior
+             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+@@ -138,6 +146,14 @@
+     }
+ 
+     async fn dial_udp(&self, _metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
++        if crate::group::read_only_probe()
++            && matches!(
++                self.adapter_type,
++                AdapterType::Reject | AdapterType::RejectDrop
++            )
++        {
++            return Err(MeowError::Other(crate::group::PROBE_BLOCKED.into()));
++        }
+         Ok(Box::new(RejectPacketConn))
+     }
+ 

@@ -29,6 +29,7 @@ struct Session {
     base: String,
     unix_controller: Option<UnixController>,
     flow_tokens: std::collections::HashMap<String, String>,
+    probe_runtime: tokio::sync::watch::Sender<crate::proxy_ip_probe::RuntimeState>,
 }
 
 struct UnixController {
@@ -57,6 +58,7 @@ impl UnixController {
         let socket = tokio::net::UnixListener::bind(&path).context("bind Unix controller")?;
         let mut controller = Self { path, task: None };
         std::fs::set_permissions(&controller.path, std::fs::Permissions::from_mode(0o600))?;
+        let router = router.layer(axum::Extension(crate::proxy_ip_probe::UnixControllerPeer));
         controller.task = Some(tokio::spawn(async move {
             if let Err(error) = axum::serve(socket, router).await {
                 tracing::error!("Unix Clash API stopped: {error}");
@@ -77,9 +79,9 @@ pub fn capabilities() -> String {
     serde_json::json!({
         "schemaVersion":1, "core":"meow", "version":crate::CORE_VERSION,
         "jni":true, "cli":true, "tunFd":cfg!(unix),
-        "clashApi":true, "mixed":true, "socks5":true, "http":true,
+        "clashApi":true, "mixed":true, "socks5":true, "http":true, "proxyIpProbe":true,
         "rootTproxy":cfg!(target_os = "android"), "rootTun":false,
-        "age":true, "subscriptionHwid":true, "autoSwitch":true,
+        "age":true, "subscriptionHwid":true,
         "systemDns":true, "libclashFacade":true, "isolatedValidation":true,
         "dnsOutbound":true, "tunDnsTcp":true, "tunDnsUdp":true,
         "ageIdentities":["X25519"], "tunStacks":["lwip"], "selectableCongestionController":false,
@@ -154,6 +156,7 @@ fn start_inner(
         meow_api::ensure_listeners_supported(&config.listeners.named, crate::listeners::supported)?;
         crate::platform::configure_process_mode(&process_mode);
         let mut session = start_config(
+            Path::new(home),
             config,
             config_path,
             settings,
@@ -174,6 +177,7 @@ fn start_inner(
 }
 
 async fn start_config(
+    home: &Path,
     config: Config,
     config_path: Option<String>,
     settings: crate::autoswitch::Settings,
@@ -268,10 +272,14 @@ async fn start_config(
         dns_server: dns_handle,
     });
     let autoswitch = crate::autoswitch::Service::new(app.tunnel.clone());
+    let (probe_runtime, _) =
+        tokio::sync::watch::channel(crate::proxy_ip_probe::RuntimeState::Running);
     let router = crate::control::router(
         Arc::clone(&app),
         autoswitch.clone(),
         controller_unix.clone(),
+        probe_runtime.clone(),
+        home.to_path_buf(),
     );
     let unix_controller = match controller_unix {
         Some(path) => {
@@ -289,7 +297,9 @@ async fn start_config(
     };
     if let Some(address) = address {
         let socket = tokio::net::TcpListener::bind(address).await?;
-        let service = router.clone();
+        let service = router
+            .clone()
+            .into_make_service_with_connect_info::<std::net::SocketAddr>();
         tokio::spawn(async move {
             if let Err(e) = axum::serve(socket, service).await {
                 tracing::error!("Clash API stopped: {e}");
@@ -309,6 +319,7 @@ async fn start_config(
         base: String::new(),
         unix_controller,
         flow_tokens,
+        probe_runtime,
     })
 }
 
@@ -392,6 +403,9 @@ pub fn stop() {
     crate::tun2socks::stop();
     let session = SESSION.lock().take();
     if let Some(session) = session {
+        session
+            .probe_runtime
+            .send_replace(crate::proxy_ip_probe::RuntimeState::Stopped);
         crate::get_runtime().block_on(session.autoswitch.stop());
         session.app.tunnel.statistics().close_all_connections();
         session.app.tunnel.close_all_udp_sessions();

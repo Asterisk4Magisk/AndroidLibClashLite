@@ -40,6 +40,8 @@ def prepare_sources(repo, work, core):
         text = patches.get(name, (core / name).read_text(encoding='utf-8'))
         patches[name] = replace_once(text, old, new)
 
+    patch_proxy_ip(patch)
+
     patch('listener/socks/tcp.go', '\tcase socks5.Version:\n',
           '\tcase FlowHeaderByte:\n\t\tHandleFlow(bufConn, tunnel, store, additions...)\n\tcase socks5.Version:\n')
     patch('listener/mixed/mixed.go', '\tcase socks5.Version:\n',
@@ -180,3 +182,267 @@ def prepare_sources(repo, work, core):
     overlay = work / 'overlay.json'
     overlay.write_text(json.dumps({'Replace': replacements}), encoding='utf-8')
     return source, overlay
+
+
+def patch_proxy_ip(patch):
+    groups = 'adapter/outboundgroup/'
+    for name in ('selector.go', 'fallback.go', 'urltest.go', 'loadbalance.go'):
+        patch(groups + name, 'import (', 'import (\n\t"cfa/native/proxyip"')
+
+    base = groups + 'groupbase.go'
+    patch(base, 'func (gb *GroupBase) GetProxies(touch bool) []C.Proxy {',
+          'func (gb *GroupBase) GetProxies(touch bool) []C.Proxy {\n'
+          '\treturn gb.groupProxies(touch, true)\n}\n\n'
+          'func (gb *GroupBase) groupProxies(touch, cache bool) []C.Proxy {')
+    patch(base, '\tproviderVersions := make([]uint32, len(gb.providers))',
+          '\thasUnloadedProvider := false\n\tproviderVersions := make([]uint32, len(gb.providers))')
+    patch(base, '\t\tproviderVersions[i] = pd.Version()',
+          '\t\tproviderVersions[i] = pd.Version()\n'
+          '\t\tif !cache && providerVersions[i] == 0 && pd.VehicleType() != P.Compatible {\n'
+          '\t\t\thasUnloadedProvider = true\n\t\t}')
+    patch(base, '\t\treturn []C.Proxy{gb.EmptyFallback()}',
+          '\t\tif hasUnloadedProvider {\n\t\t\treturn nil\n\t\t}\n'
+          '\t\treturn []C.Proxy{gb.EmptyFallback()}')
+    patch(base, '\tgb.providerVersions = providerVersions\n\tgb.providerProxies = proxies',
+          '\tif cache {\n\t\tgb.providerVersions = providerVersions\n'
+          '\t\tgb.providerProxies = proxies\n\t}')
+    patch(base, 'type GroupBase struct {',
+          'var errProbeNoCandidates = errors.New("no active proxy candidates")\n\ntype GroupBase struct {')
+
+    selector = groups + 'selector.go'
+    fallback = groups + 'fallback.go'
+    urltest = groups + 'urltest.go'
+    for path in (selector, fallback, urltest):
+        patch(path, '\tC "github.com/metacubex/mihomo/constant"',
+              '\t"github.com/metacubex/mihomo/common/atomic"\n'
+              '\tC "github.com/metacubex/mihomo/constant"')
+    patch(selector, 'selected   string', 'selected   atomic.TypedValue[string]')
+    patch(selector, 'selected:   selectorOption.DefaultSelected,',
+          'selected:   atomic.NewTypedValue(selectorOption.DefaultSelected),')
+    patch(selector, '\t\t\ts.selected = name', '\t\t\ts.selected.Store(name)')
+    patch(selector, '\ts.selected = name', '\ts.selected.Store(name)')
+    for method in ('DialContext', 'ListenPacketContext'):
+        patch(selector, f's.selectedProxy(true).{method}(ctx, metadata)',
+              f'proxy.{method}(ctx, metadata)')
+    for call in ('c, err := proxy.DialContext', 'pc, err := proxy.ListenPacketContext'):
+        patch(selector, '\t' + call, '\tproxy := s.dialProxy(ctx)\n'
+              '\tif proxy == nil {\n\t\treturn nil, errProbeNoCandidates\n\t}\n\t' + call)
+    patch(selector, '\tproxies := s.GetProxies(touch)\n\tfor _, proxy := range proxies {\n'
+          '\t\tif proxy.Name() == s.selected {',
+          '\treturn s.selectFrom(s.GetProxies(touch))\n}\n\n'
+          'func (s *Selector) dialProxy(ctx context.Context) C.Proxy {\n'
+          '\tif proxyip.ReadOnly(ctx) {\n\t\tproxies := s.groupProxies(false, false)\n'
+          '\t\tif len(proxies) == 0 {\n\t\t\treturn nil\n\t\t}\n'
+          '\t\treturn s.selectFrom(proxies)\n\t}\n'
+          '\treturn s.selectedProxy(true)\n}\n\n'
+          'func (s *Selector) selectFrom(proxies []C.Proxy) C.Proxy {\n'
+          '\tselected := s.selected.Load()\n\tfor _, proxy := range proxies {\n'
+          '\t\tif proxy.Name() == selected {')
+
+    patch(fallback, 'selected       string', 'selected       atomic.TypedValue[string]')
+    patch(fallback, '"fixed":          f.selected,', '"fixed":          f.selected.Load(),')
+    patch(fallback, '\tf.selected = name\n\tif !p.AliveForTestUrl',
+          '\tf.selected.Store(name)\n\tif !p.AliveForTestUrl')
+    patch(fallback, '\tf.selected = name\n}', '\tf.selected.Store(name)\n}')
+    patch(fallback, '\tproxies := f.GetProxies(touch)\n\tfor _, proxy := range proxies {\n'
+          '\t\tif len(f.selected) == 0 {',
+          '\treturn f.findAliveFrom(f.GetProxies(touch), true)\n}\n\n'
+          'func (f *Fallback) dialProxy(ctx context.Context) C.Proxy {\n'
+          '\tif proxyip.ReadOnly(ctx) {\n\t\tproxies := f.groupProxies(false, false)\n'
+          '\t\tif len(proxies) == 0 {\n\t\t\treturn nil\n\t\t}\n'
+          '\t\treturn f.findAliveFrom(proxies, false)\n\t}\n'
+          '\treturn f.findAliveProxy(true)\n}\n\n'
+          'func (f *Fallback) findAliveFrom(proxies []C.Proxy, persist bool) C.Proxy {\n'
+          '\tselected := f.selected.Load()\n\tfor _, proxy := range proxies {\n'
+          '\t\tif selected == "" {')
+    patch(fallback, 'proxy.Name() == f.selected {', 'proxy.Name() == selected {')
+    patch(fallback, '\t\t\t\t\tf.selected = ""',
+          '\t\t\t\t\tif persist {\n\t\t\t\t\t\tf.selected.CompareAndSwap(selected, "")\n\t\t\t\t\t}\n'
+          '\t\t\t\t\tselected = ""')
+
+    patch(urltest, 'selected       string', 'selected       atomic.TypedValue[string]')
+    patch(urltest, 'fastNode       C.Proxy', 'fastNode       atomic.TypedValue[C.Proxy]')
+    patch(urltest, '\tu.selected = name', '\tu.selected.Store(name)')
+    patch(urltest, '"fixed":          u.selected,', '"fixed":          u.selected.Load(),')
+    patch(urltest, '''\t\tproxies := u.GetProxies(touch)
+		if u.selected != "" {
+			for _, proxy := range proxies {
+				if !proxy.AliveForTestUrl(u.testUrl) {
+					continue
+				}
+				if proxy.Name() == u.selected {
+					u.fastNode = proxy
+					return proxy, nil
+				}
+			}
+		}
+
+		fast := proxies[0]
+		minDelay := fast.LastDelayForTestUrl(u.testUrl)
+		fastNotExist := true
+
+		for _, proxy := range proxies[1:] {
+			if u.fastNode != nil && proxy.Name() == u.fastNode.Name() {
+				fastNotExist = false
+			}
+
+			if !proxy.AliveForTestUrl(u.testUrl) {
+				continue
+			}
+
+			delay := proxy.LastDelayForTestUrl(u.testUrl)
+			if delay < minDelay {
+				fast = proxy
+				minDelay = delay
+			}
+
+		}
+		// tolerance
+		if u.fastNode == nil || fastNotExist || !u.fastNode.AliveForTestUrl(u.testUrl) || u.fastNode.LastDelayForTestUrl(u.testUrl) > fast.LastDelayForTestUrl(u.testUrl)+u.tolerance {
+			u.fastNode = fast
+		}
+		return u.fastNode, nil''',
+          '''\t\tchosen := u.fastFrom(u.GetProxies(touch))
+		u.fastNode.Store(chosen)
+		return chosen, nil''')
+    patch(urltest, '// SupportUDP implements C.ProxyAdapter',
+          '''func (u *URLTest) dialProxy(ctx context.Context) C.Proxy {
+	if proxyip.ReadOnly(ctx) {
+		proxies := u.groupProxies(false, false)
+		if len(proxies) == 0 {
+			return nil
+		}
+		return u.fastFrom(proxies)
+	}
+	return u.fast(true)
+}
+
+func (u *URLTest) fastFrom(proxies []C.Proxy) C.Proxy {
+	if selected := u.selected.Load(); selected != "" {
+		for _, proxy := range proxies {
+			if proxy.AliveForTestUrl(u.testUrl) && proxy.Name() == selected {
+				return proxy
+			}
+		}
+	}
+
+	incumbent := u.fastNode.Load()
+	fast := proxies[0]
+	minDelay := fast.LastDelayForTestUrl(u.testUrl)
+	fastNotExist := true
+	for _, proxy := range proxies[1:] {
+		if incumbent != nil && proxy.Name() == incumbent.Name() {
+			fastNotExist = false
+		}
+		if !proxy.AliveForTestUrl(u.testUrl) {
+			continue
+		}
+		if delay := proxy.LastDelayForTestUrl(u.testUrl); delay < minDelay {
+			fast = proxy
+			minDelay = delay
+		}
+	}
+	if incumbent == nil || fastNotExist || !incumbent.AliveForTestUrl(u.testUrl) || incumbent.LastDelayForTestUrl(u.testUrl) > fast.LastDelayForTestUrl(u.testUrl)+u.tolerance {
+		return fast
+	}
+	return incumbent
+}
+
+// SupportUDP implements C.ProxyAdapter''')
+
+    balance = groups + 'loadbalance.go'
+    strategy_args = 'proxies []C.Proxy, metadata *C.Metadata, touch bool'
+    patch(balance, f'type strategyFn = func({strategy_args})',
+          f'type readOnlySelection struct{{}}\n\ntype strategyFn = func({strategy_args}, probe ...readOnlySelection)')
+    for mode, first_line in (
+        ('_', 'idxMutex.Lock()'),
+        ('_', 'key := utils.MapHash(keyOf(metadata))\n\t\tbuckets :='),
+        ('probe', 'key := utils.MapHash(keyOf(metadata))\n\t\tlength :='),
+    ):
+        anchor = f'return func({strategy_args}) C.Proxy {{\n\t\t{first_line}'
+        patch(balance, anchor, anchor.replace('touch bool)', f'touch bool, {mode} ...readOnlySelection)'))
+    patch(balance, 'idx, has := lruCache.Get(key)',
+          'readOnly := len(probe) != 0\n'
+          '\t\tvar idx int\n\t\tvar has bool\n\t\tif readOnly {\n\t\t\tidx, has = lruCache.Peek(key)\n\t\t} else {\n'
+          '\t\t\tidx, has = lruCache.Get(key)\n\t\t}')
+    patch(balance, 'if !has || nowIdx != idx {', 'if !readOnly && (!has || nowIdx != idx) {')
+    patch(balance, '\t\tlruCache.Set(key, 0)', '\t\tif !readOnly {\n\t\t\tlruCache.Set(key, 0)\n\t\t}')
+    patch(balance, 'return lb.strategyFn(proxies, metadata, touch)',
+          'return lb.strategyFn(proxies, metadata, touch)\n}\n\n'
+          'func (lb *LoadBalance) dialProxy(ctx context.Context, metadata *C.Metadata) C.Proxy {\n'
+          '\tif proxyip.ReadOnly(ctx) {\n'
+          '\t\tproxies := lb.groupProxies(false, false)\n'
+          '\t\tif len(proxies) == 0 {\n\t\t\treturn nil\n\t\t}\n'
+          '\t\treturn lb.strategyFn(proxies, metadata, false, readOnlySelection{})\n\t}\n'
+          '\treturn lb.Unwrap(metadata, true)')
+
+    for path, group, pick, method in (
+        (fallback, 'f', 'f.findAliveProxy(true)', 'f.dialProxy(ctx)'),
+        (urltest, 'u', 'u.fast(true)', 'u.dialProxy(ctx)'),
+        (balance, 'lb', 'lb.Unwrap(metadata, true)', 'lb.dialProxy(ctx, metadata)'),
+    ):
+        pick_read_only = '\tproxy := ' + method + '\n\tif proxy == nil {\n\t\treturn nil, errProbeNoCandidates\n\t}\n'
+        patch(path, '\tproxy := ' + pick + '\n\tc', pick_read_only + '\tc')
+        second = '\tproxy := ' + pick + '\n'
+        patch(path, second, pick_read_only)
+        failure = '\n\t\t' + group + '.onDialFailed(proxy.Type(), err, ' + group + '.healthCheck)\n\t}\n\n\tif N.NeedHandshake'
+        patch(path, '\t} else {' + failure, '\t} else if !proxyip.ReadOnly(ctx) {' + failure)
+        patch(path, '\tif N.NeedHandshake(c) {', '\tif !proxyip.ReadOnly(ctx) && N.NeedHandshake(c) {')
+    patch(urltest, '\t} else {\n\t\tu.onDialFailed(proxy.Type(), err, u.healthCheck)\n\t}\n\n\treturn pc',
+          '\t} else if !proxyip.ReadOnly(ctx) {\n\t\tu.onDialFailed(proxy.Type(), err, u.healthCheck)\n\t}\n\n\treturn pc')
+
+    patch('common/lru/lrucache.go', '// Get returns any representation',
+          '''// Peek reads a live entry without moving it or expiring it from the cache.
+func (c *LruCache[K, V]) Peek(key K) (V, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	el := c.cache[key]
+	if el == nil || (!c.staleReturn && c.maxAge > 0 && el.Value.expires <= time.Now().Unix()) {
+		return lo.Empty[V](), false
+	}
+	return el.Value.value, true
+}
+
+// Get returns any representation''')
+
+    reject = 'adapter/outbound/reject.go'
+    patch(reject, 'import (', 'import (\n\t"cfa/native/proxyip"')
+    for signature in (
+        'func (r *Reject) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {',
+        'func (r *Reject) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {',
+    ):
+        patch(reject, signature, signature + '\n'
+              '\tif proxyip.ReadOnly(ctx) && (r.Type() == C.Reject || r.Type() == C.RejectDrop) {\n'
+              '\t\treturn nil, proxyip.ErrBlocked\n\t}')
+
+    tunnel = 'tunnel/tunnel.go'
+    patch(tunnel, '\tconfigMux     sync.RWMutex', '\tconfigMux     sync.RWMutex\n'
+          '\tproxyIPRuntime context.Context\n\tstopProxyIP context.CancelFunc')
+    patch(tunnel, 'func OnSuspend() {\n\tstatus.Store(Suspend)\n}',
+          '''func OnSuspend() {
+	configMux.Lock()
+	defer configMux.Unlock()
+	status.Store(Suspend)
+	if stopProxyIP != nil {
+		stopProxyIP()
+		proxyIPRuntime, stopProxyIP = nil, nil
+	}
+}''')
+    patch(tunnel, 'func OnRunning() {\n\tstatus.Store(Running)\n}',
+          '''func OnRunning() {
+	configMux.Lock()
+	defer configMux.Unlock()
+	if stopProxyIP != nil {
+		stopProxyIP()
+	}
+	proxyIPRuntime, stopProxyIP = context.WithCancel(context.Background())
+	status.Store(Running)
+}
+
+// ProxyIPProbeTarget captures the target and the lifetime of its running config.
+func ProxyIPProbeTarget(name string) (C.Proxy, context.Context) {
+	configMux.RLock()
+	defer configMux.RUnlock()
+	return proxies[name], proxyIPRuntime
+}''')
+    patch('hub/executor/executor.go', 'func Shutdown() {', 'func Shutdown() {\n\ttunnel.OnSuspend()')
