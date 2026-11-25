@@ -18,7 +18,9 @@ fn run(args: Vec<String>) -> Result<i32> {
                 return Ok(0);
             }
             "-h" | "--help" => {
-                println!("meow Android: libmeow.so [-d HOME] [-f CONFIG] [-t]\n-v, --version  Print version\n-t            Validate configuration offline");
+                println!(
+                    "meow Android: libmeow.so [-d HOME] [-f CONFIG] [-t]\n-v, --version  Print version\n-t            Validate configuration offline"
+                );
                 return Ok(0);
             }
             "-d" | "--directory" => {
@@ -63,6 +65,10 @@ fn run(args: Vec<String>) -> Result<i32> {
     })?;
     #[cfg(target_os = "android")]
     let mut system_dns = crate::systemdns::root::Watcher::start(std::path::Path::new(&home))?;
+    #[cfg(target_os = "android")]
+    {
+        crate::dns_uid::install();
+    }
     let result = crate::engine::start(
         &home,
         &home,

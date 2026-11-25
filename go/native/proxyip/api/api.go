@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 
+	"cfa/native/controlauth"
 	"cfa/native/proxyip"
 	"github.com/metacubex/chi"
 	"github.com/metacubex/chi/render"
@@ -25,9 +26,7 @@ func init() {
 }
 
 func handle(w http.ResponseWriter, r *http.Request) {
-	_, unix := r.Context().Value(http.LocalAddrContextKey).(*net.UnixAddr)
-	if !(unix || proxyip.Loopback(r.RemoteAddr)) || !proxyip.ValidToken(C.Path.HomeDir(), r.Header.Get(proxyip.TokenHeader)) {
-		replyError(w, r, http.StatusForbidden, "PERMISSION_DENIED")
+	if !controlauth.RequireLocalToken(w, r) {
 		return
 	}
 	body := http.MaxBytesReader(w, r.Body, 4096)

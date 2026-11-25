@@ -79,7 +79,7 @@ pub fn capabilities() -> String {
     serde_json::json!({
         "schemaVersion":1, "core":"meow", "version":crate::CORE_VERSION,
         "jni":true, "cli":true, "tunFd":cfg!(unix),
-        "clashApi":true, "mixed":true, "socks5":true, "http":true, "proxyIpProbe":true,
+        "clashApi":true, "mixed":true, "socks5":true, "http":true, "proxyIpProbe":true, "dnsEvents":1,
         "rootTproxy":cfg!(target_os = "android"), "rootTun":false,
         "age":true, "subscriptionHwid":true,
         "systemDns":true, "libclashFacade":true, "isolatedValidation":true,
@@ -423,9 +423,12 @@ pub fn request(method: &str, path: &str, body: &str) -> Result<String> {
     let route = path.split('?').next().unwrap_or(path);
     if !path.starts_with('/')
         || path.starts_with("//")
-        || matches!(route, "/logs" | "/traffic" | "/memory")
+        || matches!(
+            route,
+            "/logs" | "/traffic" | "/memory" | crate::dns_events::PATH
+        )
     {
-        bail!("request requires a finite Clash API path; use traffic/readLogs for streams");
+        bail!("request requires a finite Clash API path");
     }
     let (router, secret) = SESSION
         .lock()

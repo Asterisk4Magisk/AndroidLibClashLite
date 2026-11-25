@@ -14,6 +14,7 @@ func Snapshot() map[string]any {
 		"age": true, "subscriptionHwid": true, "systemDns": true,
 		"libclashFacade": true, "isolatedValidation": false, "dnsOutbound": true,
 		"tunDnsTcp": true, "tunDnsUdp": true,
+		"dnsEvents":                      1,
 		"proxyIpProbe":                   true,
 		"ageIdentities":                  []string{"X25519", "Hybrid"},
 		"tunStacks":                      []string{"system", "gvisor", "mixed", "mips"},

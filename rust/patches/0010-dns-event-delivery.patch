@@ -1,0 +1,534 @@
+--- a/crates/meow-config/src/dns_outbound.rs
++++ b/crates/meow-config/src/dns_outbound.rs
+@@ -3,7 +3,7 @@
+ use meow_common::adapter::ProxyHealth;
+ use meow_common::error::{MeowError, Result};
+ use meow_common::{AdapterType, Metadata, ProxyAdapter, ProxyConn, ProxyPacketConn};
+-use meow_dns::{DnsServer, ResolverSlot};
++use meow_dns::{events::QueryUid, DnsServer, ResolverSlot};
+ use std::{
+     io,
+     net::SocketAddr,
+@@ -18,23 +18,7 @@
+     stream: S,
+     slot: ResolverSlot,
+ ) -> io::Result<()> {
+-    serve_tcp_with_uid(stream, slot, None).await
+-}
+-
+-pub async fn serve_tcp_with_uid<S: AsyncRead + AsyncWrite + Unpin>(
+-    stream: S,
+-    slot: ResolverSlot,
+-    uid: Option<u32>,
+-) -> io::Result<()> {
+-    serve_tcp_for_flow(
+-        stream,
+-        slot,
+-        FlowUid {
+-            uid,
+-            ..FlowUid::default()
+-        },
+-    )
+-    .await
++    serve_tcp_with_uid_lookup(stream, slot, |_| QueryUid::Known(None)).await
+ }
+ 
+ #[derive(Clone, Copy, Default)]
+@@ -57,15 +41,15 @@
+         }
+     }
+ 
+-    fn resolve(self, tcp: bool, query: &[u8]) -> Option<u32> {
++    fn resolve(self, tcp: bool, query: &[u8]) -> QueryUid {
+         meow_dns::events::enhanced_uid(tcp, self.source, self.destination, query, self.uid)
+     }
+ }
+ 
+-async fn serve_tcp_for_flow<S: AsyncRead + AsyncWrite + Unpin>(
++pub async fn serve_tcp_with_uid_lookup<S: AsyncRead + AsyncWrite + Unpin>(
+     mut stream: S,
+     slot: ResolverSlot,
+-    flow: FlowUid,
++    mut owner: impl FnMut(&[u8]) -> QueryUid,
+ ) -> io::Result<()> {
+     loop {
+         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+@@ -77,17 +61,13 @@
+         })
+         .await??;
+         let resolver = slot.read().clone();
+-        let response = DnsServer::handle_query_with_deadline(
+-            &query,
+-            &resolver,
+-            meow_dns::events::QueryUid::Known(flow.resolve(true, &query)),
+-            deadline,
+-        )
+-        .await
+-        .map_err(|err| {
+-            err.downcast::<tokio::time::error::Elapsed>()
+-                .map_or_else(io::Error::other, |elapsed| io::Error::from(*elapsed))
+-        })?;
++        let response =
++            DnsServer::handle_query_with_deadline(&query, &resolver, owner(&query), deadline)
++                .await
++                .map_err(|err| {
++                    err.downcast::<tokio::time::error::Elapsed>()
++                        .map_or_else(io::Error::other, |elapsed| io::Error::from(*elapsed))
++                })?;
+         tokio::time::timeout_at(deadline, async {
+             let size = u16::try_from(response.len()).map_err(io::Error::other)?;
+             stream.write_u16(size).await?;
+@@ -139,7 +119,8 @@
+         let (client, server) = tokio::io::duplex(65536);
+         let flow = FlowUid::from_metadata(metadata);
+         let task = tokio::spawn(async move {
+-            let _ = serve_tcp_for_flow(server, slot, flow).await;
++            let _ =
++                serve_tcp_with_uid_lookup(server, slot, |query| flow.resolve(true, query)).await;
+         });
+         Ok(Box::new(DnsStream {
+             stream: client,
+@@ -222,7 +203,8 @@
+             _ = closed.wait_for(|v| *v) => Err(io::Error::from(io::ErrorKind::BrokenPipe).into()),
+             result = async {
+                 let uid = self.flow.resolve(false, buf);
+-                let response = DnsServer::handle_query_with_timeout(buf, &resolver, uid, Duration::from_secs(5))
++                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
++                let response = DnsServer::handle_query_with_deadline(buf, &resolver, uid, deadline)
+                     .await.map_err(io::Error::other)?;
+                 self.tx.send((response, *addr)).await.map_err(io::Error::other)?;
+                 Ok(buf.len())
+--- a/crates/meow-dns/src/events.rs
++++ b/crates/meow-dns/src/events.rs
+@@ -11,13 +11,13 @@
+     cell::RefCell,
+     fmt::Write as _,
+     sync::{
+-        atomic::{AtomicUsize, Ordering},
+-        Arc, LazyLock, Mutex,
++        atomic::{AtomicU64, AtomicUsize, Ordering},
++        Arc, Mutex,
+     },
+-    time::{Instant, SystemTime, UNIX_EPOCH},
++    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+ };
+ use tokio::{
+-    sync::{broadcast, oneshot},
++    sync::{broadcast, mpsc, oneshot, watch, Semaphore},
+     time,
+ };
+ 
+@@ -47,7 +47,7 @@
+     pub outbound_tag: Option<String>,
+ }
+ 
+-#[derive(Clone, Serialize)]
++#[derive(Serialize)]
+ struct Answer {
+     name: String,
+     #[serde(rename = "type")]
+@@ -55,7 +55,7 @@
+     data: String,
+ }
+ 
+-#[derive(Clone, Serialize)]
++#[derive(Serialize)]
+ #[serde(rename_all = "camelCase")]
+ pub struct Event {
+     seq: u64,
+@@ -78,22 +78,41 @@
+     outbound_tag: Option<String>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     uid: Option<u32>,
+-}
+-
+-static FEED: LazyLock<Mutex<(u64, broadcast::Sender<Event>)>> =
+-    LazyLock::new(|| Mutex::new((0, broadcast::channel(64).0)));
++    #[serde(skip_serializing_if = "Option::is_none")]
++    uid_source: Option<&'static str>,
++}
++
++struct Feed {
++    pending: mpsc::Sender<PendingEvent>,
++    events: broadcast::Sender<Arc<Event>>,
++}
++
++impl Feed {
++    fn new() -> Self {
++        let (pending, receiver) = mpsc::channel(64);
++        let (events, _) = broadcast::channel(64);
++        let output = events.clone();
++        let runtime = tokio::runtime::Handle::current();
++        let deferred = pending.downgrade();
++        tokio::task::spawn_blocking(move || format_events(receiver, output, deferred, runtime));
++        Self { pending, events }
++    }
++}
++
++static FEED: Mutex<Option<Feed>> = Mutex::new(None);
+ static SUBSCRIBERS: AtomicUsize = AtomicUsize::new(0);
++static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+ 
+ pub fn enabled() -> bool {
+     SUBSCRIBERS.load(Ordering::Relaxed) != 0
+ }
+ 
+ pub struct Subscription {
+-    receiver: broadcast::Receiver<Event>,
++    receiver: broadcast::Receiver<Arc<Event>>,
+ }
+ 
+ impl Subscription {
+-    pub async fn recv(&mut self) -> Option<Event> {
++    pub async fn recv(&mut self) -> Option<Arc<Event>> {
+         loop {
+             match self.receiver.recv().await {
+                 Ok(event) => return Some(event),
+@@ -106,12 +125,16 @@
+ 
+ impl Drop for Subscription {
+     fn drop(&mut self) {
+-        SUBSCRIBERS.fetch_sub(1, Ordering::Relaxed);
++        let mut feed = FEED.lock().expect("DNS event feed");
++        if SUBSCRIBERS.fetch_sub(1, Ordering::Relaxed) == 1 {
++            *feed = None;
++        }
+     }
+ }
+ 
+ pub fn subscribe() -> Subscription {
+-    let receiver = FEED.lock().expect("DNS event feed").1.subscribe();
++    let mut feed = FEED.lock().expect("DNS event feed");
++    let receiver = feed.get_or_insert_with(Feed::new).events.subscribe();
+     SUBSCRIBERS.fetch_add(1, Ordering::Relaxed);
+     Subscription { receiver }
+ }
+@@ -146,63 +169,187 @@
+     destination: Option<std::net::SocketAddr>,
+     query: &[u8],
+     fallback: Option<u32>,
+-) -> Option<u32> {
++) -> QueryUid {
+     if let (Some(lookup), Some(source), Some(destination)) =
+         (ENHANCED_UID_LOOKUP.get(), source, destination)
+     {
+         if enabled() {
+             if let Some(uid) = lookup(tcp, source, destination, query) {
+-                return (uid != u32::MAX).then_some(uid);
+-            }
+-        }
+-    }
+-    fallback
++                return if uid == u32::MAX {
++                    QueryUid::Known(None)
++                } else {
++                    QueryUid::Enhanced(uid)
++                };
++            }
++        }
++    }
++    QueryUid::Known(fallback)
+ }
+ 
+ pub enum QueryUid {
+     Known(Option<u32>),
++    Enhanced(u32),
+     Pending {
+         receiver: oneshot::Receiver<Option<u32>>,
+         deadline: time::Instant,
+     },
++    Connection(watch::Receiver<Option<Option<u32>>>),
++}
++
++struct PendingEvent {
++    completed: SystemTime,
++    delay: u64,
++    query: Vec<u8>,
++    response: Option<Vec<u8>>,
++    origin: Origin,
++    uid: QueryUid,
++    timed_out: bool,
++}
++
++pub(crate) struct Observation {
++    pending: mpsc::WeakSender<PendingEvent>,
++    start: Instant,
++}
++
++pub(crate) fn begin() -> Option<Observation> {
++    if !enabled() {
++        return None;
++    }
++    let feed = FEED.try_lock().ok()?;
++    Some(Observation {
++        pending: feed.as_ref()?.pending.downgrade(),
++        start: Instant::now(),
++    })
+ }
+ 
+ pub(crate) fn finish(
+-    start: Instant,
++    observation: Observation,
+     query: &[u8],
+     response: Option<&[u8]>,
+     uid: QueryUid,
+     timed_out: bool,
+ ) {
+-    if !enabled() {
+-        return;
+-    }
+-    let completed = SystemTime::now();
+-    let delay = start.elapsed().as_millis() as u64;
+-    let Ok(query) = Message::from_vec(query) else {
++    // A query can finish after its subscribers leave. Its original sender
++    // expires with that feed, and copying runs outside the subscription lock.
++    let Some(pending) = observation.pending.upgrade() else {
+         return;
+     };
++    let Ok(slot) = pending.try_reserve() else {
++        return;
++    };
++    slot.send(PendingEvent {
++        completed: SystemTime::now(),
++        delay: observation.start.elapsed().as_millis() as u64,
++        query: query.to_vec(),
++        response: response.map(<[u8]>::to_vec),
++        origin: ORIGIN.with(|origin| origin.take()),
++        uid,
++        timed_out,
++    });
++}
++
++const DEFERRED_UID_LIMIT: usize = 16;
++const UID_WAIT: Duration = Duration::from_millis(25);
++
++fn format_events(
++    mut pending: mpsc::Receiver<PendingEvent>,
++    output: broadcast::Sender<Arc<Event>>,
++    deferred: mpsc::WeakSender<PendingEvent>,
++    runtime: tokio::runtime::Handle,
++) {
++    let slots = Arc::new(Semaphore::new(DEFERRED_UID_LIMIT));
++    while let Some(mut event) = pending.blocking_recv() {
++        if output.receiver_count() == 0 {
++            break;
++        }
++        if let Some(uid) = ready_uid(&mut event.uid) {
++            event.uid = QueryUid::Known(uid);
++        } else if matches!(
++            event.uid,
++            QueryUid::Pending { .. } | QueryUid::Connection(_)
++        ) {
++            if let Ok(permit) = slots.clone().try_acquire_owned() {
++                let deferred = deferred.clone();
++                runtime.spawn(async move {
++                    let _permit = permit;
++                    event.uid = QueryUid::Known(wait_for_uid(event.uid).await);
++                    if let Some(sender) = deferred.upgrade() {
++                        let _ = sender.try_send(event);
++                    }
++                });
++                continue;
++            }
++            event.uid = QueryUid::Known(None);
++        }
++        if let Some(event) = format_event(event) {
++            let _ = output.send(Arc::new(event));
++        }
++    }
++}
++
++// The outer option says whether the owner query has completed, even if it found no UID.
++fn ready_uid(uid: &mut QueryUid) -> Option<Option<u32>> {
++    match uid {
++        QueryUid::Pending { receiver, .. } => match receiver.try_recv() {
++            Ok(uid) => Some(uid),
++            Err(oneshot::error::TryRecvError::Closed) => Some(None),
++            Err(oneshot::error::TryRecvError::Empty) => None,
++        },
++        QueryUid::Connection(receiver) => *receiver.borrow(),
++        _ => None,
++    }
++}
++
++async fn wait_for_uid(uid: QueryUid) -> Option<u32> {
++    match uid {
++        QueryUid::Pending { receiver, deadline } => {
++            let deadline = deadline.min(time::Instant::now() + UID_WAIT);
++            time::timeout_at(deadline, receiver)
++                .await
++                .ok()
++                .and_then(Result::ok)
++                .flatten()
++        }
++        QueryUid::Connection(mut receiver) => {
++            time::timeout(UID_WAIT, receiver.wait_for(Option::is_some))
++                .await
++                .ok()
++                .and_then(Result::ok)
++                .and_then(|uid| (*uid).flatten())
++        }
++        _ => None,
++    }
++}
++
++fn format_event(event: PendingEvent) -> Option<Event> {
++    let query = Message::from_vec(&event.query).ok()?;
+     if query.metadata.message_type != MessageType::Query || query.metadata.op_code != OpCode::Query
+     {
+-        return;
+-    }
+-    let Some(question) = query.queries.first() else {
+-        return;
++        return None;
++    }
++    let question = query.queries.first()?;
++    let response = event
++        .response
++        .as_deref()
++        .and_then(|bytes| Message::from_vec(bytes).ok());
++    let (uid, source) = match event.uid {
++        QueryUid::Enhanced(uid) => (Some(uid), "enhance"),
++        QueryUid::Known(uid) => (uid, "socket"),
++        QueryUid::Pending { .. } | QueryUid::Connection(_) => (None, "socket"),
+     };
+-    let response = response.and_then(|bytes| Message::from_vec(bytes).ok());
+-    let origin = ORIGIN.with(|origin| origin.take());
+-    let mut event = Event {
+-        seq: 0,
+-        time: completed
++    Some(Event {
++        seq: SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1,
++        time: event
++            .completed
+             .duration_since(UNIX_EPOCH)
+             .unwrap_or_default()
+             .as_millis() as u64,
+-        delay,
++        delay: event.delay,
+         qname: question.name.to_ascii(),
+         qtype: u16::from(question.query_type),
+         status: if response.is_some() {
+             "answered"
+-        } else if timed_out {
++        } else if event.timed_out {
+             "timeout"
+         } else {
+             "failed"
+@@ -220,44 +367,13 @@
+                 })
+                 .collect()
+         }),
+-        answer_source: origin.source,
+-        upstream: origin.upstream.as_deref().and_then(upstream_address),
+-        route: origin.route,
+-        outbound_tag: origin.outbound_tag,
+-        uid: None,
+-    };
+-    match uid {
+-        QueryUid::Known(uid) => event.uid = uid,
+-        QueryUid::Pending {
+-            mut receiver,
+-            deadline,
+-        } => match receiver.try_recv() {
+-            Ok(uid) => event.uid = uid,
+-            Err(oneshot::error::TryRecvError::Empty) => {
+-                tokio::spawn(async move {
+-                    event.uid = time::timeout_at(deadline, receiver)
+-                        .await
+-                        .ok()
+-                        .and_then(Result::ok)
+-                        .flatten();
+-                    publish(event);
+-                });
+-                return;
+-            }
+-            Err(oneshot::error::TryRecvError::Closed) => {}
+-        },
+-    }
+-    publish(event);
+-}
+-
+-fn publish(mut event: Event) {
+-    if !enabled() {
+-        return;
+-    }
+-    let mut feed = FEED.lock().expect("DNS event feed");
+-    feed.0 += 1;
+-    event.seq = feed.0;
+-    let _ = feed.1.send(event);
++        answer_source: event.origin.source,
++        upstream: event.origin.upstream.as_deref().and_then(upstream_address),
++        route: event.origin.route,
++        outbound_tag: event.origin.outbound_tag,
++        uid,
++        uid_source: uid.map(|_| source),
++    })
+ }
+ 
+ fn record_data(data: &RData) -> String {
+--- a/crates/meow-dns/src/server.rs
++++ b/crates/meow-dns/src/server.rs
+@@ -118,21 +118,6 @@
+         Self::observe_query(data, resolver, crate::events::QueryUid::Known(None), None).await
+     }
+ 
+-    pub async fn handle_query_with_timeout(
+-        data: &[u8],
+-        resolver: &Resolver,
+-        uid: Option<u32>,
+-        timeout: std::time::Duration,
+-    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+-        Self::handle_query_with_deadline(
+-            data,
+-            resolver,
+-            crate::events::QueryUid::Known(uid),
+-            tokio::time::Instant::now() + timeout,
+-        )
+-        .await
+-    }
+-
+     pub async fn handle_query_with_deadline(
+         data: &[u8],
+         resolver: &Resolver,
+@@ -155,10 +140,9 @@
+                 None => query.await,
+             }
+         };
+-        if !crate::events::enabled() {
++        let Some(observation) = crate::events::begin() else {
+             return handle().await;
+-        }
+-        let start = std::time::Instant::now();
++        };
+         crate::events::ORIGIN
+             .scope(Default::default(), async {
+                 let result = handle().await;
+@@ -166,7 +150,7 @@
+                     .as_ref()
+                     .err()
+                     .is_some_and(|err| err.is::<tokio::time::error::Elapsed>());
+-                crate::events::finish(start, data, result.as_deref().ok(), uid, timed_out);
++                crate::events::finish(observation, data, result.as_deref().ok(), uid, timed_out);
+                 result
+             })
+             .await
+@@ -337,15 +321,14 @@
+     /// `pub` for the TUN dns-hijack path (`meow-listener`), which answers
+     /// locally-decidable queries inline instead of spending a task spawn.
+     pub fn try_answer_local(data: &[u8], resolver: &Resolver) -> LocalAnswer {
+-        if !crate::events::enabled() {
++        let Some(observation) = crate::events::begin() else {
+             return Self::try_answer_local_inner(data, resolver);
+-        }
+-        let start = std::time::Instant::now();
++        };
+         crate::events::ORIGIN.sync_scope(Default::default(), || {
+             let outcome = Self::try_answer_local_inner(data, resolver);
+             if let LocalAnswer::Answer(response) = &outcome {
+                 crate::events::finish(
+-                    start,
++                    observation,
+                     data,
+                     Some(response),
+                     crate::events::QueryUid::Known(None),

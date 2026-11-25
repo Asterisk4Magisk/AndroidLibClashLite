@@ -41,6 +41,7 @@ def prepare_sources(repo, work, core):
         patches[name] = replace_once(text, old, new)
 
     patch_proxy_ip(patch)
+    patch_dns_events(patch)
 
     patch('listener/socks/tcp.go', '\tcase socks5.Version:\n',
           '\tcase FlowHeaderByte:\n\t\tHandleFlow(bufConn, tunnel, store, additions...)\n\tcase socks5.Version:\n')
@@ -446,3 +447,250 @@ func ProxyIPProbeTarget(name string) (C.Proxy, context.Context) {
 	return proxies[name], proxyIPRuntime
 }''')
     patch('hub/executor/executor.go', 'func Shutdown() {', 'func Shutdown() {\n\ttunnel.OnSuspend()')
+
+
+def patch_dns_events(patch):
+    event = 'cfa/native/dnsevents'
+    relay = 'component/resolver/relay.go'
+    server = 'dns/server.go'
+    service = 'dns/service.go'
+    resolver = 'dns/resolver.go'
+    util = 'dns/util.go'
+    dialer = 'tunnel/dns_dialer.go'
+    for path in (relay, server, service, resolver, util, dialer):
+        patch(path, 'import (', f'import (\n\t"{event}"')
+
+    # A DNS stream can outlive an observation session. Prepare its owner per message.
+    prepare = 'prepareOwner func(context.Context) context.Context'
+    tcp = 'func RelayDnsConn(ctx context.Context, conn net.Conn, readTimeout time.Duration)'
+    patch(relay, tcp + ' error {',
+          tcp + ' error {\n\treturn RelayDnsConnWithOwner(ctx, conn, readTimeout, nil)\n}\n\n'
+          f'func RelayDnsConnWithOwner(ctx context.Context, conn net.Conn, readTimeout time.Duration, {prepare}) error {{')
+    patch(relay, 'relayDnsPacket(ctx, inData, outBuff, 0)', 'relayDnsPacket(ctx, inData, outBuff, 0, prepareOwner)')
+    patch(relay, 'func relayDnsPacket(ctx context.Context, payload []byte, target []byte, maxSize int)',
+          f'func relayDnsPacket(ctx context.Context, payload []byte, target []byte, maxSize int, {prepare})')
+    udp = 'func RelayDnsPacket(ctx context.Context, payload []byte, target []byte)'
+    patch(relay, udp + ' ([]byte, error) {',
+          udp + ' ([]byte, error) {\n\treturn RelayDnsPacketWithOwner(ctx, payload, target, nil)\n}\n\n'
+          f'func RelayDnsPacketWithOwner(ctx context.Context, payload []byte, target []byte, {prepare}) ([]byte, error) {{')
+    patch(relay, 'relayDnsPacket(ctx, payload, target, SafeDnsPacketSize)',
+          'relayDnsPacket(ctx, payload, target, SafeDnsPacketSize, prepareOwner)')
+    patch(relay, '\tr, err := ServeMsg(ctx, msg)',
+          '\tif dnsevents.Enabled() {\n'
+          '\t\tif prepareOwner != nil {\n\t\t\tctx = prepareOwner(ctx)\n\t\t}\n'
+          '\t\tctx = dnsevents.WithEnhancedUID(ctx, payload)\n'
+          '\t}\n'
+          '\tctx, observation := dnsevents.Start(ctx, msg)\n\tr, err := ServeMsg(ctx, msg)')
+    patch(relay, '\t\treturn m.PackBuffer(target)',
+          '\t\tdata, packErr := m.PackBuffer(target)\n'
+          '\t\tif packErr != nil {\n\t\t\tm = nil\n\t\t}\n'
+          '\t\tobservation.Finish(msg, m, err)\n'
+          '\t\treturn data, packErr')
+    patch(relay, '\tdata, err := r.PackBuffer(target)\n\tif err != nil {',
+          '\tdata, err := r.PackBuffer(target)\n\tif err != nil {\n\t\tobservation.Finish(msg, nil, err)')
+    patch(relay, '\treturn data, nil\n}',
+          '\tobservation.Finish(msg, r, nil)\n\treturn data, nil\n}')
+    patch(server, '\tmsg, err := s.service.ServeMsg(context.Background(), r)',
+          '\tctx, observation := dnsevents.Start(context.Background(), r)\n'
+          '\tmsg, err := s.service.ServeMsg(ctx, r)')
+    patch(server, '\t\tw.WriteMsg(m)', '\t\tobservation.Finish(r, m, err)\n\t\tw.WriteMsg(m)')
+    patch(server, '\tmsg.Compress = true\n\tw.WriteMsg(msg)',
+          '\tmsg.Compress = true\n\tobservation.Finish(r, msg, nil)\n\tw.WriteMsg(msg)')
+    patch(service, '\tr, err := s.handler(icontext.NewDNSContext(ctx), msg)',
+          '\tdnsCtx := icontext.NewDNSContext(ctx)\n\tr, err := s.handler(dnsCtx, msg)\n'
+          '\tif dnsevents.Enabled() && err == nil {\n'
+          '\t\tswitch dnsCtx.Type() {\n'
+          '\t\tcase icontext.DNSTypeHost: dnsevents.SourceIfUnknown(ctx, "hosts")\n'
+          '\t\tcase icontext.DNSTypeFakeIP: dnsevents.SourceIfUnknown(ctx, "fake-ip")\n'
+          '\t\t}\n\t}')
+
+    middleware = 'dns/middleware.go'
+    patch(middleware, 'import (', f'import (\n\t"{event}"')
+    patch(middleware, '\t\tcase D.TypeSVCB, D.TypeHTTPS:\n\t\t\t\treturn handleMsgWithEmptyAnswer(r), nil',
+          '\t\tcase D.TypeSVCB, D.TypeHTTPS:\n'
+          '\t\t\t\tdnsevents.SourceIfUnknown(ctx, "fake-ip")\n\t\t\t\treturn handleMsgWithEmptyAnswer(r), nil')
+    for pool in ('fakePool', 'fakePool6'):
+        patch(middleware, f'if {pool} == nil {{\n\t\t\t\t\treturn handleMsgWithEmptyAnswer(r), nil',
+              f'if {pool} == nil {{\n\t\t\t\t\tdnsevents.SourceIfUnknown(ctx, "fake-ip")\n'
+              '\t\t\t\t\treturn handleMsgWithEmptyAnswer(r), nil')
+    patch(middleware, 'if !ipv6 && q.Qtype == D.TypeAAAA {\n\t\t\treturn handleMsgWithEmptyAnswer(r), nil',
+          'if !ipv6 && q.Qtype == D.TypeAAAA {\n\t\t\tdnsevents.SourceIfUnknown(ctx, "local")\n'
+          '\t\t\treturn handleMsgWithEmptyAnswer(r), nil')
+
+    # Carry the winning attempt through fallback and singleflight, including
+    # followers whose response is copied by the existing resolver.
+    patch(resolver, 'type result struct {', 'type result struct {\n\tOrigin *dnsevents.Origin')
+    patch(resolver, 'type result struct {', 'type dnsResult struct {\n\tMsg *D.Msg\n'
+          '\tOrigin *dnsevents.Origin\n}\n\ntype result struct {')
+    patch(resolver, 'singleflight.Group[*D.Msg]', 'singleflight.Group[dnsResult]')
+    patch(resolver, '\tif hit {\n\t\tlog.Debugln("[DNS] cache hit',
+          '\tif hit {\n\t\tdnsevents.SetOrigin(ctx, dnsevents.Origin{Source: "cache"})\n'
+          '\t\tlog.Debugln("[DNS] cache hit')
+    patch(resolver, 'fn := func() (result *D.Msg, err error) {',
+          'fn := func() (result dnsResult, err error) {')
+    patch(resolver, '\t\t\t\tresult = &D.Msg{}\n\t\t\t\tresult.Opcode = retryNum',
+          '\t\t\t\tresult.Msg = &D.Msg{}\n\t\t\t\tresult.Msg.Opcode = retryNum')
+    patch(resolver, 'putMsgToCache(r.cache, q, result)', 'putMsgToCache(r.cache, q, result.Msg)')
+    patch(resolver, 'return r.ipExchange(ctx, m)',
+          'result.Msg, result.Origin, err = r.ipExchange(ctx, m)\n\t\t\treturn')
+    for clients in ('matched', 'r.main'):
+        patch(resolver, f'result, cache, err = batchExchange(ctx, {clients}, m)',
+              f'result.Msg, result.Origin, cache, err = batchExchange(ctx, {clients}, m)')
+    patch(resolver, 'singleflight.Result[*D.Msg]', 'singleflight.Result[dnsResult]')
+    patch(resolver, 'if err != nil && !shared && ret.Opcode < retryMax { // retry\n'
+                    '\t\t\t\t\tr.group.DoChan(q.String(), fn)',
+          'if err != nil && !shared && ret.Msg.Opcode < retryMax { // retry\n'
+          '\t\t\t\t\tr.group.DoChan(q.String(), fn)')
+    patch(resolver, 'if err != nil && !shared && ret.Opcode < retryMax { // retry\n'
+                    '\t\tr.group.DoChan(q.String(), fn)',
+          'if err != nil && !shared && ret.Msg.Opcode < retryMax { // retry\n'
+          '\t\tr.group.DoChan(q.String(), fn)')
+    patch(resolver, '\t\tmsg = ret\n\t\tif shared {',
+          '\t\tmsg = ret.Msg\n\t\tif ret.Origin != nil { dnsevents.SetOrigin(ctx, *ret.Origin) }\n\t\tif shared {')
+    patch(resolver, 'func (r *Resolver) ipExchange(ctx context.Context, m *D.Msg) (msg *D.Msg, err error)',
+          'func (r *Resolver) ipExchange(ctx context.Context, m *D.Msg) '
+          '(msg *D.Msg, origin *dnsevents.Origin, err error)')
+    # Individual branches have distinct surrounding text in the pinned core.
+    for clients in ('matched', 'r.fallback'):
+        patch(resolver, f'res := <-r.asyncExchange(ctx, {clients}, m)\n\t\treturn res.Msg, res.Error',
+              f'res := <-r.asyncExchange(ctx, {clients}, m)\n\t\treturn res.Msg, res.Origin, res.Error')
+    for suffix in ('\n\t\treturn', ' // no need to wait for fallback result', '\n\treturn'):
+        patch(resolver, 'msg, err = res.Msg, res.Error' + suffix,
+              'msg, origin, err = res.Msg, res.Origin, res.Error' + suffix)
+    patch(resolver, 'res, _, err := batchExchange(ctx, client, msg)\n\t\tch <- &result{Msg: res, Error: err}',
+          'res, origin, _, err := batchExchange(ctx, client, msg)\n'
+          '\t\tch <- &result{Msg: res, Origin: origin, Error: err}')
+    for path in ('dns/dhcp.go', 'dns/system.go'):
+        patch(path, 'msg, _, err = batchExchange', 'msg, _, _, err = batchExchange')
+
+    patch(util, '(msg *D.Msg, cache bool, err error) {\n\tcache = true',
+          '(msg *D.Msg, origin *dnsevents.Origin, cache bool, err error) {\n\tcache = true')
+    patch(util, 'picker.WithTimeout[*D.Msg](ctx, resolver.DefaultDNSTimeout)',
+          'picker.WithTimeout[dnsResult](ctx, resolver.DefaultDNSTimeout)')
+    patch(util, 'return msg, false, err',
+          'if dnsevents.Enabled() { origin = &dnsevents.Origin{Source: "local"} }\n\t\treturn msg, origin, false, err')
+    patch(util, 'fast.Go(func() (*D.Msg, error) {',
+          'fast.Go(func() (dnsResult, error) {')
+    patch(util, 'import (', 'import (\n\t"sync/atomic"')
+    patch(util, 'func batchExchange(', '''// DNS event attribution follows the actual wrapper path of the successful attempt.
+func describeDNSAttempt(c dnsClient, msg *D.Msg) (*dnsevents.Origin, bool) {
+	for {
+		if filter, ok := c.(clientWithDisableTypes); ok && slices.ContainsFunc(msg.Question, filter.inQuestion) {
+			return &dnsevents.Origin{Source: "local"}, false
+		}
+		wrapper, ok := c.(interface{ Unwrap() dnsClient })
+		if !ok {
+			break
+		}
+		c = wrapper.Unwrap()
+	}
+	switch c.(type) {
+	case rcodeClient:
+		return &dnsevents.Origin{Source: "local"}, false
+	case *systemClient, *dhcpClient, *easyTierDNSClient, *tailscaleDNSClient:
+		// These clients do not expose the winning endpoint.
+		return &dnsevents.Origin{Source: "upstream"}, false
+	case *dnsOverQUIC:
+		return &dnsevents.Origin{Source: "upstream", Upstream: c, UpstreamScheme: "quic"}, false
+	case *client:
+		return &dnsevents.Origin{Source: "upstream", Upstream: c}, true
+	default:
+		return &dnsevents.Origin{Source: "upstream", Upstream: c}, false
+	}
+}
+
+func batchExchange(''')
+    patch(util, '\t\t\tm, err := client.ExchangeContext(ctx, m)',
+          '\t\t\tctx := ctx\n\t\t\tvar origin *dnsevents.Origin\n'
+          '\t\t\tvar egress *atomic.Pointer[dnsevents.Egress]\n'
+          '\t\t\tif dnsevents.Enabled() {\n'
+          '\t\t\t\tvar fresh bool\n\t\t\t\torigin, fresh = describeDNSAttempt(client, m)\n'
+          '\t\t\t\tif fresh { ctx, egress = dnsevents.TrackEgress(ctx) }\n\t\t\t}\n'
+          '\t\t\tm, err := client.ExchangeContext(ctx, m)')
+    patch(util, '\t\t\t\treturn nil, err' + '\n\t\t\t} else if cache',
+          '\t\t\t\treturn dnsResult{}, err' + '\n\t\t\t} else if cache')
+    patch(util, 'return nil, errors.New("server failure: "',
+          'return dnsResult{}, errors.New("server failure: "')
+    patch(util, '\t\t\treturn m, nil\n\t\t})',
+          '\t\t\tif egress != nil {\n'
+          '\t\t\t\tif info := egress.Load(); info != nil { origin.Egress = *info }\n'
+          '\t\t\t}\n'
+          '\t\t\treturn dnsResult{Msg: m, Origin: origin}, nil\n\t\t})')
+    patch(util, '\tmsg = fast.Wait()\n\tif msg == nil {',
+          '\tif selected := fast.Wait(); selected.Msg != nil {\n'
+          '\t\tmsg, origin = selected.Msg, selected.Origin\n\t} else {')
+
+    patch(dialer, '\t\t\treturn dialer.DialContext(ctx, network, addr, opts...)',
+          '\t\t\tdnsevents.SetEgress(ctx, "direct", "")\n\t\t\treturn dialer.DialContext(ctx, network, addr, opts...)')
+    patch(dialer, '\t\t\treturn dialer.DialContext(ctx, network, metadata.AddrPort().String(), opts...)',
+          '\t\t\tdnsevents.SetEgress(ctx, "direct", "")\n'
+          '\t\t\treturn dialer.DialContext(ctx, network, metadata.AddrPort().String(), opts...)')
+    patch(dialer, '\t\tlogMetadata(metadata, rule, conn)',
+          '\t\trecordDNSEgress(ctx, proxyAdapter, conn)\n\t\tlogMetadata(metadata, rule, conn)')
+    patch(dialer, '\t\tlogMetadata(metadata, rule, packetConn)',
+          '\t\trecordDNSEgress(ctx, proxyAdapter, packetConn)\n\t\tlogMetadata(metadata, rule, packetConn)')
+    patch(dialer, 'const DnsRespectRules = "RULES"',
+          '''const DnsRespectRules = "RULES"
+
+func recordDNSEgress(ctx context.Context, adapter C.ProxyAdapter, connection C.Connection) {
+	if !dnsevents.TrackingEgress(ctx) {
+		return
+	}
+	name := connection.Chains().Last()
+	if name == "" {
+		return
+	}
+	if name != adapter.Name() {
+		configMux.RLock()
+		leaf := proxies[name]
+		provider := providers[connection.ProviderChains().Last()]
+		configMux.RUnlock()
+		if provider != nil {
+			leaf = nil
+			for _, candidate := range provider.Proxies() {
+				if candidate.Name() == name {
+					leaf = candidate
+					break
+				}
+			}
+		}
+		if leaf == nil {
+			dnsevents.SetEgress(ctx, "", name)
+			return
+		}
+		adapter = leaf
+	}
+	kind := adapter.Type()
+	switch kind {
+	case C.Direct:
+		dnsevents.SetEgress(ctx, "direct", name)
+	case C.Selector, C.Fallback, C.LoadBalance, C.URLTest, C.Compatible, C.Dns, C.Reject, C.RejectDrop, C.Pass:
+		// No identifiable network egress.
+	default:
+		dnsevents.SetEgress(ctx, "proxy", name)
+	}
+}''')
+
+    tun = 'listener/sing_tun/dns.go'
+    patch(tun, 'import (', 'import (\n\t"cfa/native/dnsevents/owner"')
+    patch(tun, 'return resolver.RelayDnsConn(ctx, conn, resolver.DefaultDnsReadTimeout)',
+          'return resolver.RelayDnsConnWithOwner(ctx, conn, resolver.DefaultDnsReadTimeout, func(ctx context.Context) context.Context {\n'
+          '\t\t\treturn owner.ForFlow(ctx, "tcp", metadata.Source.AddrPort(), metadata.Destination.AddrPort())\n\t\t})')
+    patch(tun, 'go relayDnsPacket(ctx, buffer, rwOptions, metadata.Destination, nil, &writer)',
+          'go relayDnsPacket(ctx, buffer, rwOptions, metadata.Source, metadata.Destination, nil, &writer)')
+    patch(tun, 'go relayDnsPacket(ctx, readBuff, rwOptions, dest, &mutex, &writer)',
+          'go relayDnsPacket(ctx, readBuff, rwOptions, metadata.Source, dest, &mutex, &writer)')
+    patch(tun, 'rwOptions network.ReadWaitOptions, dest M.Socksaddr, mutex *sync.Mutex',
+          'rwOptions network.ReadWaitOptions, source, dest M.Socksaddr, mutex *sync.Mutex')
+    patch(tun, 'resolver.RelayDnsPacket(ctx, inData, writeBuff.FreeBytes())',
+          'resolver.RelayDnsPacketWithOwner(ctx, inData, writeBuff.FreeBytes(), func(ctx context.Context) context.Context {\n'
+          '\t\treturn owner.ForFlow(ctx, "udp", source.AddrPort(), dest.AddrPort())\n\t})')
+
+    outbound = 'adapter/outbound/dns.go'
+    patch(outbound, 'import (', 'import (\n\t"cfa/native/dnsevents/owner"')
+    patch(outbound, 'go resolver.RelayDnsConn(context.Background(), right, 0)',
+          'go resolver.RelayDnsConnWithOwner(context.Background(), right, 0, owner.PrepareMetadata(metadata))')
+    patch(outbound, '\t\tctx:      ctx,\n', '\t\tctx:      ctx,\n\t\tprepareOwner: owner.PrepareMetadata(metadata),\n')
+    patch(outbound, 'response chan dnsPacket', 'response chan dnsPacket\n\tprepareOwner func(context.Context) context.Context')
+    patch(outbound, 'resolver.RelayDnsPacket(ctx, buf[:len(p)], buf)',
+          'resolver.RelayDnsPacketWithOwner(ctx, buf[:len(p)], buf, d.prepareOwner)')

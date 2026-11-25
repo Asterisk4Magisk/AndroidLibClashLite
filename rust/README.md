@@ -160,6 +160,9 @@ The response describes the compiled binding, including `core`, `version`,
 `dnsOptions`. Capabilities describe implemented behavior, even when an unsupported
 configuration option is tolerated. Unknown keys can be ignored by callers.
 
+`proxyIpProbe: true` and `dnsEvents: 1` advertise the shared
+[controller extensions](../go/README.md#controller-extensions).
+
 `Libclash.diagnoseConfig(byte[])` returns a JSON array of compatibility warnings
 (`code`, `field`, `message`), without changing the live configuration. It decrypts
 using the configured AGE identities. This is not full configuration validation;

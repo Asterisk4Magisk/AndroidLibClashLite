@@ -1,0 +1,138 @@
+--- a/crates/meow-config/src/dns_outbound.rs
++++ b/crates/meow-config/src/dns_outbound.rs
+@@ -22,9 +22,50 @@
+ }
+ 
+ pub async fn serve_tcp_with_uid<S: AsyncRead + AsyncWrite + Unpin>(
++    stream: S,
++    slot: ResolverSlot,
++    uid: Option<u32>,
++) -> io::Result<()> {
++    serve_tcp_for_flow(
++        stream,
++        slot,
++        FlowUid {
++            uid,
++            ..FlowUid::default()
++        },
++    )
++    .await
++}
++
++#[derive(Clone, Copy, Default)]
++struct FlowUid {
++    uid: Option<u32>,
++    source: Option<SocketAddr>,
++    destination: Option<SocketAddr>,
++}
++
++impl FlowUid {
++    fn from_metadata(metadata: &Metadata) -> Self {
++        Self {
++            uid: metadata.uid,
++            source: metadata
++                .src_ip
++                .map(|ip| SocketAddr::new(ip, metadata.src_port)),
++            destination: metadata
++                .dst_ip
++                .map(|ip| SocketAddr::new(ip, metadata.dst_port)),
++        }
++    }
++
++    fn resolve(self, tcp: bool, query: &[u8]) -> Option<u32> {
++        meow_dns::events::enhanced_uid(tcp, self.source, self.destination, query, self.uid)
++    }
++}
++
++async fn serve_tcp_for_flow<S: AsyncRead + AsyncWrite + Unpin>(
+     mut stream: S,
+     slot: ResolverSlot,
+-    uid: Option<u32>,
++    flow: FlowUid,
+ ) -> io::Result<()> {
+     loop {
+         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+@@ -39,7 +80,7 @@
+         let response = DnsServer::handle_query_with_deadline(
+             &query,
+             &resolver,
+-            meow_dns::events::QueryUid::Known(uid),
++            meow_dns::events::QueryUid::Known(flow.resolve(true, &query)),
+             deadline,
+         )
+         .await
+@@ -96,9 +137,9 @@
+     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
+         let slot = self.resolver()?;
+         let (client, server) = tokio::io::duplex(65536);
+-        let uid = metadata.uid;
++        let flow = FlowUid::from_metadata(metadata);
+         let task = tokio::spawn(async move {
+-            let _ = serve_tcp_with_uid(server, slot, uid).await;
++            let _ = serve_tcp_for_flow(server, slot, flow).await;
+         });
+         Ok(Box::new(DnsStream {
+             stream: client,
+@@ -110,7 +151,7 @@
+         let (closed, _) = watch::channel(false);
+         Ok(Box::new(DnsPacket {
+             slot: self.resolver()?,
+-            uid: metadata.uid,
++            flow: FlowUid::from_metadata(metadata),
+             tx,
+             rx: Mutex::new(rx),
+             closed,
+@@ -153,7 +194,7 @@
+ }
+ struct DnsPacket {
+     slot: ResolverSlot,
+-    uid: Option<u32>,
++    flow: FlowUid,
+     tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
+     rx: Mutex<mpsc::Receiver<(Vec<u8>, SocketAddr)>>,
+     closed: watch::Sender<bool>,
+@@ -180,7 +221,8 @@
+         tokio::select! {
+             _ = closed.wait_for(|v| *v) => Err(io::Error::from(io::ErrorKind::BrokenPipe).into()),
+             result = async {
+-                let response = DnsServer::handle_query_with_timeout(buf, &resolver, self.uid, Duration::from_secs(5))
++                let uid = self.flow.resolve(false, buf);
++                let response = DnsServer::handle_query_with_timeout(buf, &resolver, uid, Duration::from_secs(5))
+                     .await.map_err(io::Error::other)?;
+                 self.tx.send((response, *addr)).await.map_err(io::Error::other)?;
+                 Ok(buf.len())
+--- a/crates/meow-dns/src/events.rs
++++ b/crates/meow-dns/src/events.rs
+@@ -131,6 +131,32 @@
+         source: Some(source),
+         ..Origin::default()
+     });
++}
++
++type EnhancedUidLookup = fn(bool, std::net::SocketAddr, std::net::SocketAddr, &[u8]) -> Option<u32>;
++static ENHANCED_UID_LOOKUP: std::sync::OnceLock<EnhancedUidLookup> = std::sync::OnceLock::new();
++
++pub fn set_enhanced_uid_lookup(lookup: EnhancedUidLookup) {
++    let _ = ENHANCED_UID_LOOKUP.set(lookup);
++}
++
++pub fn enhanced_uid(
++    tcp: bool,
++    source: Option<std::net::SocketAddr>,
++    destination: Option<std::net::SocketAddr>,
++    query: &[u8],
++    fallback: Option<u32>,
++) -> Option<u32> {
++    if let (Some(lookup), Some(source), Some(destination)) =
++        (ENHANCED_UID_LOOKUP.get(), source, destination)
++    {
++        if enabled() {
++            if let Some(uid) = lookup(tcp, source, destination, query) {
++                return (uid != u32::MAX).then_some(uid);
++            }
++        }
++    }
++    fallback
+ }
+ 
+ pub enum QueryUid {

@@ -7,6 +7,7 @@ import (
 	"cfa/native/capabilities"
 	_ "cfa/native/capabilities/api"
 	profile "cfa/native/config"
+	_ "cfa/native/dnsevents/api"
 	_ "cfa/native/proxyip/api"
 	"github.com/metacubex/mihomo/config"
 )

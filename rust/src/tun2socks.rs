@@ -16,7 +16,7 @@ use crate::logging;
 use crate::platform as owner;
 use futures::{SinkExt, StreamExt};
 use meow_common::{ConnType, Metadata, Network, ProxyConn};
-use meow_dns::DnsServer;
+use meow_dns::{events::QueryUid, DnsServer};
 use meow_tunnel::udp::UdpSession;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -32,8 +32,9 @@ use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, Interest, ReadBuf};
-use tokio::sync::{mpsc, Notify, Semaphore};
+use tokio::sync::{mpsc, oneshot, Notify, Semaphore};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tracing::warn;
 
 pub(crate) type UdpMsg = (Vec<u8>, SocketAddr, SocketAddr);
@@ -236,7 +237,10 @@ async fn run_tun2socks(
                             let handle = tokio::spawn(async move {
                                 if hijack {
                                     if let Some(tunnel) = engine::tunnel() {
-                                        let _ = meow_config::dns_outbound::serve_tcp(stream, tunnel.resolver_slot()).await;
+                                        let owner = tcp_dns_owner(local_addr, remote_addr);
+                                        let _ = meow_config::dns_outbound::serve_tcp_with_uid_lookup(
+                                            stream, tunnel.resolver_slot(), owner,
+                                        ).await;
                                     }
                                 } else {
                                     dispatch_tcp(stream, local_addr, remote_addr).await;
@@ -261,8 +265,11 @@ async fn run_tun2socks(
                                         return;
                                     };
                                     if let Some(tunnel) = engine::tunnel() {
-                                        if let Ok(Ok(response)) = tokio::time::timeout(DNS_TASK_TIMEOUT,
-                                            DnsServer::handle_query(&payload, &tunnel.resolver())).await {
+                                        let deadline = Instant::now() + DNS_TASK_TIMEOUT;
+                                        let uid = pending_dns_uid(src, dst, deadline);
+                                        if let Ok(response) = DnsServer::handle_query_with_deadline(
+                                            &payload, &tunnel.resolver(), uid, deadline,
+                                        ).await {
                                             let _ = reply_tx.send((response, dst, src)).await;
                                         }
                                     }
@@ -396,6 +403,47 @@ async fn abort_flow_tasks(flow_tasks: &FlowTasks) {
 // ---------------------------------------------------------------------------
 // TCP dispatch
 // ---------------------------------------------------------------------------
+
+static DNS_UID_BUDGET: Semaphore = Semaphore::const_new(DNS_BURST_CAP);
+
+fn tcp_dns_owner(source: SocketAddr, destination: SocketAddr) -> impl FnMut(&[u8]) -> QueryUid {
+    let mut connection: Option<tokio::sync::watch::Receiver<Option<Option<u32>>>> = None;
+    move |_| {
+        if !meow_dns::events::enabled() {
+            return QueryUid::Known(None);
+        }
+        if let Some(receiver) = &connection {
+            return QueryUid::Connection(receiver.clone());
+        }
+        let Ok(permit) = DNS_UID_BUDGET.try_acquire() else {
+            return QueryUid::Known(None);
+        };
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        connection = Some(receiver.clone());
+        tokio::spawn(async move {
+            let _permit = permit;
+            let uid = owner::lookup_uid(owner::IPPROTO_TCP, source, destination).await;
+            let _ = sender.send(Some(uid));
+        });
+        QueryUid::Connection(receiver)
+    }
+}
+
+fn pending_dns_uid(source: SocketAddr, destination: SocketAddr, deadline: Instant) -> QueryUid {
+    if !meow_dns::events::enabled() {
+        return QueryUid::Known(None);
+    }
+    let Ok(permit) = DNS_UID_BUDGET.try_acquire() else {
+        return QueryUid::Known(None);
+    };
+    let (sender, receiver) = oneshot::channel();
+    tokio::spawn(async move {
+        let _permit = permit;
+        let result = owner::lookup_uid(owner::IPPROTO_UDP, source, destination).await;
+        let _ = sender.send(result);
+    });
+    QueryUid::Pending { receiver, deadline }
+}
 
 async fn dispatch_tcp(stream: lwip::TcpStream, src_addr: SocketAddr, dst_addr: SocketAddr) {
     let tunnel = match engine::tunnel() {

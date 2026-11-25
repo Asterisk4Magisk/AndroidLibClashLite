@@ -110,6 +110,28 @@ DNS options and connection tracking. `Libclash.diagnoseConfig(byte[])` returns
 `[]` for a parseable Go profile and throws for malformed input. The Rust binding
 uses the same API to report its [compatibility limits](../rust/README.md#capability-boundary).
 
+### Controller extensions
+
+Mihomo and Meow expose these operations over the existing Unix socket or
+loopback controller. Send the usual controller credentials and
+`X-Asterisk-Probe-Token` with the 64-digit hex token stored in
+`<core-home>/proxy-ip-probe.token`.
+
+- **Exit IP** (`proxyIpProbe: true`). Send `POST /asterisk/proxy-ip-probe`
+  with an `outboundTag` and an HTTPS `url`. The core uses the group's
+  current selection logic and returns `status` and, on success, the endpoint's
+  response body in `response`.
+- **DNS events** (`dnsEvents: 1`). Open `GET /asterisk/dns-events` for live
+  NDJSON. Each event has `seq`, `time`, `delay`, `qname`, `qtype` and
+  `status`. Times are in milliseconds. Replies add `rcode` and `answers`.
+  A timed-out Mihomo query can include the SERVFAIL reply's `rcode`.
+  `answerSource`, `upstream`, `uid`, `uidSource`, `route` and `outboundTag`
+  are optional. `uidSource` is `enhance` for the original UID from
+  AsteriskEnhance or `socket` for connection ownership. In ROOT, a matching
+  AsteriskEnhance UID takes precedence. Open the stream only while collecting.
+  Delivery is best effort and events can be dropped under load. Mihomo limits
+  its event answer list to 64 records or 8 KiB of uncompressed DNS record data.
+
 ## Standalone CLI
 
 Enable native extraction in the app (`packaging.jniLibs.useLegacyPackaging = true`).

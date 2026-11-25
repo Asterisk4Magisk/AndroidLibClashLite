@@ -130,6 +130,18 @@ pub async fn lookup(protocol: i32, source: SocketAddr, destination: SocketAddr) 
         .flatten()
 }
 
+pub(crate) async fn lookup_uid(
+    protocol: i32,
+    source: SocketAddr,
+    destination: SocketAddr,
+) -> Option<u32> {
+    let callbacks = CALLBACKS.read().clone()?;
+    tokio::task::spawn_blocking(move || callbacks.uid(protocol, source, destination).ok())
+        .await
+        .ok()
+        .flatten()
+}
+
 fn lookup_proxy_process(
     inner: &meow_tunnel::tunnel::TunnelInner,
     source: SocketAddr,
@@ -153,43 +165,13 @@ impl Callbacks {
     fn owner(&self, protocol: i32, source: SocketAddr, destination: SocketAddr) -> Result<Owner> {
         let mut env = self.vm.attach_current_thread()?;
         let result = env.with_local_frame(8, |env| -> Result<Owner> {
-            #[cfg(target_os = "android")]
-            let legacy_uid = if socket_owner::uses_legacy_procfs() {
-                anyhow::ensure!(is_local_source(source.ip()), "source is not local");
-                Some(
-                    socket_owner::lookup(protocol == IPPROTO_UDP, source, destination)
-                        .and_then(|uid| i32::try_from(uid).ok())
-                        .context("legacy connection owner unknown")?,
-                )
-            } else {
-                None
-            };
-            #[cfg(not(target_os = "android"))]
-            let legacy_uid: Option<i32> = None;
-            let source = JObject::from(env.new_string(source.to_string())?);
-            let destination = JObject::from(env.new_string(destination.to_string())?);
-            let uid = if let Some(uid) = legacy_uid {
-                uid
-            } else {
-                env.call_method(
-                    &self.object,
-                    "querySocketUid",
-                    "(ILjava/lang/String;Ljava/lang/String;)I",
-                    &[
-                        JValue::Int(protocol),
-                        JValue::Object(&source),
-                        JValue::Object(&destination),
-                    ],
-                )?
-                .i()?
-            };
-            let numeric_uid = u32::try_from(uid).context("connection owner unknown")?;
+            let uid = self.query_uid(env, protocol, source, destination)?;
             let package = env
                 .call_method(
                     &self.object,
                     "packageForUid",
                     "(I)Ljava/lang/String;",
-                    &[JValue::Int(uid)],
+                    &[JValue::Int(uid as i32)],
                 )?
                 .l()?;
             let package = if package.is_null() {
@@ -202,15 +184,52 @@ impl Callbacks {
                     Some(Arc::from(value))
                 }
             };
-            Ok(Owner {
-                uid: numeric_uid,
-                package,
-            })
+            Ok(Owner { uid, package })
         });
         if result.is_err() {
             let _ = env.exception_clear();
         }
         result
+    }
+    fn uid(&self, protocol: i32, source: SocketAddr, destination: SocketAddr) -> Result<u32> {
+        let mut env = self.vm.attach_current_thread()?;
+        let result =
+            env.with_local_frame(2, |env| self.query_uid(env, protocol, source, destination));
+        if result.is_err() {
+            let _ = env.exception_clear();
+        }
+        result
+    }
+
+    fn query_uid(
+        &self,
+        env: &mut JNIEnv,
+        protocol: i32,
+        source: SocketAddr,
+        destination: SocketAddr,
+    ) -> Result<u32> {
+        #[cfg(target_os = "android")]
+        if socket_owner::uses_legacy_procfs() {
+            anyhow::ensure!(is_local_source(source.ip()), "source is not local");
+            return socket_owner::lookup(protocol == IPPROTO_UDP, source, destination)
+                .filter(|uid| i32::try_from(*uid).is_ok())
+                .context("legacy connection owner unknown");
+        }
+        let source = JObject::from(env.new_string(source.to_string())?);
+        let destination = JObject::from(env.new_string(destination.to_string())?);
+        let uid = env
+            .call_method(
+                &self.object,
+                "querySocketUid",
+                "(ILjava/lang/String;Ljava/lang/String;)I",
+                &[
+                    JValue::Int(protocol),
+                    JValue::Object(&source),
+                    JValue::Object(&destination),
+                ],
+            )?
+            .i()?;
+        u32::try_from(uid).context("connection owner unknown")
     }
 }
 

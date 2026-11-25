@@ -92,17 +92,7 @@ pub(crate) async fn handle(
     if request.method() != Method::POST {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
-    let local = request.extensions().get::<UnixControllerPeer>().is_some()
-        || request
-            .extensions()
-            .get::<ConnectInfo<SocketAddr>>()
-            .is_some_and(|peer| peer.0.ip().is_loopback());
-    let token = request
-        .headers()
-        .get("x-asterisk-probe-token")
-        .and_then(|token| token.to_str().ok())
-        .unwrap_or_default();
-    if !local || !valid_token(home, token).await {
+    if !valid_token(home, local_token(&request)).await {
         return error(StatusCode::FORBIDDEN, "PERMISSION_DENIED");
     }
     let Ok(body) = to_bytes(request.into_body(), 4096).await else {
@@ -157,7 +147,23 @@ pub(crate) async fn handle(
         .into_response()
 }
 
-async fn valid_token(home: &Path, provided: &str) -> bool {
+pub(crate) fn local_token(request: &Request) -> &str {
+    let local = request.extensions().get::<UnixControllerPeer>().is_some()
+        || request
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .is_some_and(|peer| peer.0.ip().is_loopback());
+    if !local {
+        return "";
+    }
+    request
+        .headers()
+        .get("x-asterisk-probe-token")
+        .and_then(|token| token.to_str().ok())
+        .unwrap_or_default()
+}
+
+pub(crate) async fn valid_token(home: &Path, provided: &str) -> bool {
     if provided.len() != 64 || !provided.bytes().all(|b| b.is_ascii_hexdigit()) {
         return false;
     }

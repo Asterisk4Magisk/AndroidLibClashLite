@@ -1,0 +1,874 @@
+--- a/crates/meow-config/src/dns_outbound.rs
++++ b/crates/meow-config/src/dns_outbound.rs
+@@ -15,24 +15,45 @@
+ use tokio::sync::{mpsc, watch, Mutex};
+ 
+ pub async fn serve_tcp<S: AsyncRead + AsyncWrite + Unpin>(
++    stream: S,
++    slot: ResolverSlot,
++) -> io::Result<()> {
++    serve_tcp_with_uid(stream, slot, None).await
++}
++
++pub async fn serve_tcp_with_uid<S: AsyncRead + AsyncWrite + Unpin>(
+     mut stream: S,
+     slot: ResolverSlot,
++    uid: Option<u32>,
+ ) -> io::Result<()> {
+     loop {
+-        let work = async {
++        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
++        let query = tokio::time::timeout_at(deadline, async {
+             let size = stream.read_u16().await?;
+             let mut query = vec![0; usize::from(size)];
+             stream.read_exact(&mut query).await?;
+-            let resolver = slot.read().clone();
+-            let response = DnsServer::handle_query(&query, &resolver)
+-                .await
+-                .map_err(io::Error::other)?;
++            Ok::<_, io::Error>(query)
++        })
++        .await??;
++        let resolver = slot.read().clone();
++        let response = DnsServer::handle_query_with_deadline(
++            &query,
++            &resolver,
++            meow_dns::events::QueryUid::Known(uid),
++            deadline,
++        )
++        .await
++        .map_err(|err| {
++            err.downcast::<tokio::time::error::Elapsed>()
++                .map_or_else(io::Error::other, |elapsed| io::Error::from(*elapsed))
++        })?;
++        tokio::time::timeout_at(deadline, async {
+             let size = u16::try_from(response.len()).map_err(io::Error::other)?;
+             stream.write_u16(size).await?;
+             stream.write_all(&response).await?;
+             stream.flush().await
+-        };
+-        tokio::time::timeout(Duration::from_secs(30), work).await??;
++        })
++        .await??;
+     }
+ }
+ 
+@@ -72,22 +93,24 @@
+     fn health(&self) -> &ProxyHealth {
+         &self.health
+     }
+-    async fn dial_tcp(&self, _: &Metadata) -> Result<Box<dyn ProxyConn>> {
++    async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
+         let slot = self.resolver()?;
+         let (client, server) = tokio::io::duplex(65536);
++        let uid = metadata.uid;
+         let task = tokio::spawn(async move {
+-            let _ = serve_tcp(server, slot).await;
++            let _ = serve_tcp_with_uid(server, slot, uid).await;
+         });
+         Ok(Box::new(DnsStream {
+             stream: client,
+             task,
+         }))
+     }
+-    async fn dial_udp(&self, _: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
++    async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
+         let (tx, rx) = mpsc::channel(64);
+         let (closed, _) = watch::channel(false);
+         Ok(Box::new(DnsPacket {
+             slot: self.resolver()?,
++            uid: metadata.uid,
+             tx,
+             rx: Mutex::new(rx),
+             closed,
+@@ -130,6 +153,7 @@
+ }
+ struct DnsPacket {
+     slot: ResolverSlot,
++    uid: Option<u32>,
+     tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
+     rx: Mutex<mpsc::Receiver<(Vec<u8>, SocketAddr)>>,
+     closed: watch::Sender<bool>,
+@@ -156,8 +180,8 @@
+         tokio::select! {
+             _ = closed.wait_for(|v| *v) => Err(io::Error::from(io::ErrorKind::BrokenPipe).into()),
+             result = async {
+-                let response = tokio::time::timeout(Duration::from_secs(5), DnsServer::handle_query(buf, &resolver))
+-                    .await.map_err(io::Error::other)?.map_err(io::Error::other)?;
++                let response = DnsServer::handle_query_with_timeout(buf, &resolver, self.uid, Duration::from_secs(5))
++                    .await.map_err(io::Error::other)?;
+                 self.tx.send((response, *addr)).await.map_err(io::Error::other)?;
+                 Ok(buf.len())
+             } => result,
+--- a/crates/meow-dns/src/client.rs
++++ b/crates/meow-dns/src/client.rs
+@@ -550,6 +550,16 @@
+     pub(crate) v4: Option<FamilyAnswer>,
+     pub(crate) v6: Option<FamilyAnswer>,
+     pub(crate) source: String,
++    pub(crate) event_client: Option<crate::events::Upstream>,
++}
++
++impl FamilySet {
++    pub(crate) fn with_event_client(mut self, client: &Arc<DnsClient>) -> Self {
++        if crate::events::enabled() {
++            self.event_client = Some(crate::events::Upstream(Arc::clone(client)));
++        }
++        self
++    }
+ }
+ 
+ enum Transport {
+@@ -835,8 +845,76 @@
+     }
+ 
+     /// Human-readable upstream identifier for API/UI surfaces.
++    pub(crate) fn event_origin(&self) -> crate::events::Origin {
++        use meow_common::AdapterType;
++        if matches!(self.transport, Transport::RCode { .. }) {
++            return crate::events::Origin {
++                source: Some("local"),
++                ..Default::default()
++            };
++        }
++        if matches!(self.transport, Transport::System) {
++            return crate::events::Origin {
++                source: Some("upstream"),
++                ..Default::default()
++            };
++        }
++        let upstream = match &self.transport {
++            Transport::Udp { addr } | Transport::Tcp { addr } => {
++                let scheme =
++                    if matches!(self.transport, Transport::Udp { .. }) && self.proxy.is_none() {
++                        "udp"
++                    } else {
++                        "tcp"
++                    };
++                let authority = match &self.proxy_target {
++                    Some((host, port)) => format!("{host}:{port}"),
++                    None => addr.to_string(),
++                };
++                format!("{scheme}://{authority}")
++            }
++            _ => self.upstream_base_label(),
++        };
++        let (route, outbound_tag) = match self.proxy.as_ref() {
++            None => (Some("direct"), None),
++            Some(proxy) => match proxy.adapter_type() {
++                AdapterType::Selector
++                | AdapterType::Fallback
++                | AdapterType::UrlTest
++                | AdapterType::LoadBalance
++                | AdapterType::Relay
++                | AdapterType::Dns
++                | AdapterType::Reject
++                | AdapterType::RejectDrop
++                | AdapterType::Pass
++                | AdapterType::PassRule => (None, None),
++                AdapterType::Direct | AdapterType::Compatible => {
++                    (Some("direct"), Some(proxy.name().to_owned()))
++                }
++                _ => (Some("proxy"), Some(proxy.name().to_owned())),
++            },
++        };
++        crate::events::Origin {
++            source: Some("upstream"),
++            upstream: Some(upstream),
++            route,
++            outbound_tag,
++        }
++    }
++
+     pub fn upstream_label(&self) -> String {
+-        let mut label = if let Some(label) = &self.label {
++        let mut label = self.upstream_base_label();
++        if let Some(proxy) = &self.proxy {
++            // Spelling-agnostic suffix: `#PROXY` would echo the plain-form
++            // spelling onto `?proxy=` entries. `via <name>` also reports
++            // the adapter actually dialed (r15 review I4).
++            label.push_str(" via ");
++            label.push_str(proxy.name());
++        }
++        label
++    }
++    fn upstream_base_label(&self) -> String {
++        if let Some(label) = &self.label {
+             label.to_string()
+         } else {
+             match &self.transport {
+@@ -883,15 +961,7 @@
+                     }
+                 }
+             }
+-        };
+-        if let Some(proxy) = &self.proxy {
+-            // Spelling-agnostic suffix: `#PROXY` would echo the plain-form
+-            // spelling onto `?proxy=` entries. `via <name>` also reports
+-            // the adapter actually dialed (r15 review I4).
+-            label.push_str(" via ");
+-            label.push_str(proxy.name());
+-        }
+-        label
++        }
+     }
+ 
+     /// Send a query for `(name, record_type)` and return the parsed response
+@@ -1067,7 +1137,12 @@
+         } else {
+             (None, Some(answer))
+         };
+-        Ok(FamilySet { v4, v6, source })
++        Ok(FamilySet {
++            v4,
++            v6,
++            source,
++            event_client: None,
++        })
+     }
+ 
+     async fn lookup_ip_with_ipv6_inner(
+@@ -1807,6 +1882,7 @@
+         v4: result.v4.clone(),
+         v6: result.v6.clone(),
+         source,
++        event_client: None,
+     }
+ }
+ 
+--- /dev/null
++++ b/crates/meow-dns/src/events.rs
+@@ -0,0 +1,335 @@
++//! Structured events for client DNS requests. The controller subscribes to a
++//! bounded feed so publishing an event never waits for an HTTP reader.
++use crate::client::DnsClient;
++use hickory_proto::rr::rdata::svcb::{SvcParamValue, SVCB};
++use hickory_proto::{
++    op::{Message, MessageType, OpCode},
++    rr::RData,
++};
++use serde::Serialize;
++use std::{
++    cell::RefCell,
++    fmt::Write as _,
++    sync::{
++        atomic::{AtomicUsize, Ordering},
++        Arc, LazyLock, Mutex,
++    },
++    time::{Instant, SystemTime, UNIX_EPOCH},
++};
++use tokio::{
++    sync::{broadcast, oneshot},
++    time,
++};
++
++#[derive(Clone)]
++pub(crate) struct Upstream(pub(crate) Arc<DnsClient>);
++
++impl std::fmt::Debug for Upstream {
++    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        formatter
++            .debug_tuple("Upstream")
++            .field(&self.0.upstream_label())
++            .finish()
++    }
++}
++
++pub(crate) fn set_client(client: &DnsClient) {
++    if enabled() {
++        let _ = ORIGIN.try_with(|value| *value.borrow_mut() = client.event_origin());
++    }
++}
++
++#[derive(Clone, Debug, Default)]
++pub(crate) struct Origin {
++    pub source: Option<&'static str>,
++    pub upstream: Option<String>,
++    pub route: Option<&'static str>,
++    pub outbound_tag: Option<String>,
++}
++
++#[derive(Clone, Serialize)]
++struct Answer {
++    name: String,
++    #[serde(rename = "type")]
++    record_type: u16,
++    data: String,
++}
++
++#[derive(Clone, Serialize)]
++#[serde(rename_all = "camelCase")]
++pub struct Event {
++    seq: u64,
++    time: u64,
++    delay: u64,
++    qname: String,
++    qtype: u16,
++    status: &'static str,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    rcode: Option<u16>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    answers: Option<Vec<Answer>>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    answer_source: Option<&'static str>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    upstream: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    route: Option<&'static str>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    outbound_tag: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    uid: Option<u32>,
++}
++
++static FEED: LazyLock<Mutex<(u64, broadcast::Sender<Event>)>> =
++    LazyLock::new(|| Mutex::new((0, broadcast::channel(64).0)));
++static SUBSCRIBERS: AtomicUsize = AtomicUsize::new(0);
++
++pub fn enabled() -> bool {
++    SUBSCRIBERS.load(Ordering::Relaxed) != 0
++}
++
++pub struct Subscription {
++    receiver: broadcast::Receiver<Event>,
++}
++
++impl Subscription {
++    pub async fn recv(&mut self) -> Option<Event> {
++        loop {
++            match self.receiver.recv().await {
++                Ok(event) => return Some(event),
++                Err(broadcast::error::RecvError::Lagged(_)) => continue,
++                Err(broadcast::error::RecvError::Closed) => return None,
++            }
++        }
++    }
++}
++
++impl Drop for Subscription {
++    fn drop(&mut self) {
++        SUBSCRIBERS.fetch_sub(1, Ordering::Relaxed);
++    }
++}
++
++pub fn subscribe() -> Subscription {
++    let receiver = FEED.lock().expect("DNS event feed").1.subscribe();
++    SUBSCRIBERS.fetch_add(1, Ordering::Relaxed);
++    Subscription { receiver }
++}
++
++tokio::task_local! {
++    pub(crate) static ORIGIN: RefCell<Origin>;
++}
++
++pub(crate) fn set_origin(origin: Origin) {
++    if enabled() {
++        let _ = ORIGIN.try_with(|value| *value.borrow_mut() = origin);
++    }
++}
++
++pub(crate) fn source(source: &'static str) {
++    set_origin(Origin {
++        source: Some(source),
++        ..Origin::default()
++    });
++}
++
++pub enum QueryUid {
++    Known(Option<u32>),
++    Pending {
++        receiver: oneshot::Receiver<Option<u32>>,
++        deadline: time::Instant,
++    },
++}
++
++pub(crate) fn finish(
++    start: Instant,
++    query: &[u8],
++    response: Option<&[u8]>,
++    uid: QueryUid,
++    timed_out: bool,
++) {
++    if !enabled() {
++        return;
++    }
++    let completed = SystemTime::now();
++    let delay = start.elapsed().as_millis() as u64;
++    let Ok(query) = Message::from_vec(query) else {
++        return;
++    };
++    if query.metadata.message_type != MessageType::Query || query.metadata.op_code != OpCode::Query
++    {
++        return;
++    }
++    let Some(question) = query.queries.first() else {
++        return;
++    };
++    let response = response.and_then(|bytes| Message::from_vec(bytes).ok());
++    let origin = ORIGIN.with(|origin| origin.take());
++    let mut event = Event {
++        seq: 0,
++        time: completed
++            .duration_since(UNIX_EPOCH)
++            .unwrap_or_default()
++            .as_millis() as u64,
++        delay,
++        qname: question.name.to_ascii(),
++        qtype: u16::from(question.query_type),
++        status: if response.is_some() {
++            "answered"
++        } else if timed_out {
++            "timeout"
++        } else {
++            "failed"
++        },
++        rcode: response
++            .as_ref()
++            .map(|msg| u16::from(msg.metadata.response_code)),
++        answers: response.map(|msg| {
++            msg.answers
++                .iter()
++                .map(|rr| Answer {
++                    name: rr.name.to_ascii(),
++                    record_type: u16::from(rr.record_type()),
++                    data: record_data(&rr.data),
++                })
++                .collect()
++        }),
++        answer_source: origin.source,
++        upstream: origin.upstream.as_deref().and_then(upstream_address),
++        route: origin.route,
++        outbound_tag: origin.outbound_tag,
++        uid: None,
++    };
++    match uid {
++        QueryUid::Known(uid) => event.uid = uid,
++        QueryUid::Pending {
++            mut receiver,
++            deadline,
++        } => match receiver.try_recv() {
++            Ok(uid) => event.uid = uid,
++            Err(oneshot::error::TryRecvError::Empty) => {
++                tokio::spawn(async move {
++                    event.uid = time::timeout_at(deadline, receiver)
++                        .await
++                        .ok()
++                        .and_then(Result::ok)
++                        .flatten();
++                    publish(event);
++                });
++                return;
++            }
++            Err(oneshot::error::TryRecvError::Closed) => {}
++        },
++    }
++    publish(event);
++}
++
++fn publish(mut event: Event) {
++    if !enabled() {
++        return;
++    }
++    let mut feed = FEED.lock().expect("DNS event feed");
++    feed.0 += 1;
++    event.seq = feed.0;
++    let _ = feed.1.send(event);
++}
++
++fn record_data(data: &RData) -> String {
++    let mut text = String::new();
++    match data {
++        RData::TXT(txt) => {
++            for (index, chunk) in txt.txt_data.iter().enumerate() {
++                if index != 0 {
++                    text.push(' ');
++                }
++                write_character_string(&mut text, chunk);
++            }
++        }
++        RData::HINFO(info) => {
++            write_character_string(&mut text, &info.cpu);
++            text.push(' ');
++            write_character_string(&mut text, &info.os);
++        }
++        RData::SVCB(service) => return service_data(service),
++        RData::HTTPS(service) => return service_data(&service.0),
++        _ => return data.to_string(),
++    }
++    text
++}
++
++fn write_character_string(text: &mut String, bytes: &[u8]) {
++    text.push('"');
++    write_escaped_bytes(text, bytes, b"\"\\");
++    text.push('"');
++}
++
++fn write_escaped_bytes(text: &mut String, bytes: &[u8], special: &[u8]) {
++    for &byte in bytes {
++        if special.contains(&byte) {
++            text.push('\\');
++            text.push(char::from(byte));
++        } else if (b' '..=b'~').contains(&byte) {
++            text.push(char::from(byte));
++        } else {
++            let _ = write!(text, "\\{byte:03}");
++        }
++    }
++}
++
++fn write_comma_list(text: &mut String, values: &[impl std::fmt::Display]) {
++    for (index, value) in values.iter().enumerate() {
++        if index != 0 {
++            text.push(',');
++        }
++        let _ = write!(text, "{value}");
++    }
++}
++
++fn service_data(service: &SVCB) -> String {
++    let mut text = format!("{} {}", service.svc_priority, service.target_name);
++    for (key, value) in &service.svc_params {
++        let key = match u16::from(*key) {
++            7 => "dohpath".to_owned(),
++            8 => "ohttp".to_owned(),
++            _ => key.to_string(),
++        };
++        let _ = write!(text, " {key}=\"");
++        match value {
++            SvcParamValue::Mandatory(values) => write_comma_list(&mut text, &values.0),
++            SvcParamValue::Alpn(values) => {
++                for (index, value) in values.0.iter().enumerate() {
++                    if index != 0 {
++                        text.push(',');
++                    }
++                    for byte in value.bytes() {
++                        match byte {
++                            b',' => text.push_str(r"\\\044"),
++                            b'\\' => text.push_str(r"\\\092"),
++                            _ => write_escaped_bytes(&mut text, &[byte], b"\"; "),
++                        }
++                    }
++                }
++            }
++            SvcParamValue::Ipv4Hint(values) => write_comma_list(&mut text, &values.0),
++            SvcParamValue::Ipv6Hint(values) => write_comma_list(&mut text, &values.0),
++            SvcParamValue::Unknown(value) => write_escaped_bytes(&mut text, &value.0, b"\";\\"),
++            _ => {
++                let _ = write!(text, "{value}");
++            }
++        }
++        text.push('"');
++    }
++    text
++}
++
++fn upstream_address(label: &str) -> Option<String> {
++    if let Some((scheme, endpoint)) = label.split_once("://") {
++        let authority = endpoint.split(['/', '?', '#']).next()?.rsplit('@').next()?;
++        return (!authority.is_empty()).then(|| format!("{scheme}://{authority}"));
++    }
++    (!label.is_empty()
++        && label
++            .bytes()
++            .all(|c| c.is_ascii_alphanumeric() || b".:-[]".contains(&c)))
++    .then(|| label.to_owned())
++}
+--- a/crates/meow-dns/src/lib.rs
++++ b/crates/meow-dns/src/lib.rs
+@@ -5,6 +5,7 @@
+ 
+ pub mod cache;
+ pub mod client;
++pub mod events;
+ pub mod fakeip;
+ pub mod host_resolver_hook;
+ pub mod resolver;
+--- a/crates/meow-dns/src/resolver.rs
++++ b/crates/meow-dns/src/resolver.rs
+@@ -41,7 +41,9 @@
+ #[derive(Debug, thiserror::Error)]
+ #[non_exhaustive]
+ pub enum BootstrapError {
+-    #[error("default-nameserver entry '{entry}' must be a plain UDP/TCP nameserver (tls:// and https:// are not allowed here because they would create a bootstrap loop)")]
++    #[error(
++        "default-nameserver entry '{entry}' must be a plain UDP/TCP nameserver (tls:// and https:// are not allowed here because they would create a bootstrap loop)"
++    )]
+     DefaultNameserverNotPlain { entry: String },
+     #[error("cannot resolve '{host}' via bootstrap nameserver: {source}")]
+     CannotResolve { host: String, source: BoxError },
+@@ -615,7 +617,7 @@
+                 started.elapsed().as_millis()
+             );
+             // A positive answer always wins, regardless of grace state.
+-            return (Some(set), upstream_err);
++            return (Some(set.with_event_client(client)), upstream_err);
+         }
+         conn_note!(
+             Dns,
+@@ -632,7 +634,7 @@
+             // failure used to leave the timer unset, and a later
+             // definitive negative could then never enter this branch —
+             // the tier would wait out every upstream's full timeout).
+-            negative = Some(set);
++            negative = Some(set.with_event_client(client));
+             negative_deadline = Some(tokio::time::Instant::now() + NEGATIVE_GRACE_PERIOD);
+         } else if definitive
+             && !negative
+@@ -642,7 +644,7 @@
+             // A definitive negative strictly improves on a partial failure
+             // kept as the last-resort answer. First-wins still applies
+             // between two answers of equal quality.
+-            negative = Some(set);
++            negative = Some(set.with_event_client(client));
+         }
+     }
+     (negative, upstream_err)
+@@ -744,12 +746,24 @@
+     name: &Name,
+     record_type: RecordType,
+ ) -> Option<Message> {
+-    match clients.len() {
++    async fn attempt<'a>(
++        client: &'a DnsClient,
++        name: &Name,
++        record_type: RecordType,
++    ) -> Result<(Message, &'a DnsClient), ()> {
++        client
++            .query_name(name, record_type)
++            .await
++            .map(|msg| (msg, client))
++            .map_err(|_| ())
++    }
++
++    let (message, client) = match clients.len() {
+         0 => None,
+-        1 => clients[0].query_name(name, record_type).await.ok(),
++        1 => attempt(&clients[0], name, record_type).await.ok(),
+         2 => {
+-            let f1 = clients[0].query_name(name, record_type);
+-            let f2 = clients[1].query_name(name, record_type);
++            let f1 = attempt(&clients[0], name, record_type);
++            let f2 = attempt(&clients[1], name, record_type);
+             tokio::pin!(f1);
+             tokio::pin!(f2);
+             tokio::select! {
+@@ -760,13 +774,16 @@
+         _ => {
+             let futs: Vec<_> = clients
+                 .iter()
+-                .map(|c| {
+-                    Box::pin(async move { c.query_name(name, record_type).await.map_err(|_| ()) })
+-                })
++                .map(|client| Box::pin(attempt(client, name, record_type)))
+                 .collect();
+-            futures::future::select_ok(futs).await.ok().map(|(m, _)| m)
+-        }
+-    }
++            futures::future::select_ok(futs)
++                .await
++                .ok()
++                .map(|(answer, _)| answer)
++        }
++    }?;
++    crate::events::set_client(client);
++    Some(message)
+ }
+ 
+ impl Resolver {
+@@ -1504,6 +1521,7 @@
+         if self.mode == DnsMode::FakeIp {
+             if let Some(pool) = &self.fakeip_v4 {
+                 if !self.skipper_bypasses(host) {
++                    crate::events::source("fake-ip");
+                     return LocalLookup::Decided(AddressLookupResult::Answer(
+                         pool.lookup(host),
+                         self.fakeip_ttl,
+@@ -1512,6 +1530,7 @@
+             }
+         }
+         if let Some(hit) = self.fresh_family_hit(host, QueryFamilies::IPV4) {
++            crate::events::source("cache");
+             return LocalLookup::Decided(hit);
+         }
+         LocalLookup::Upstream(host)
+@@ -1571,6 +1590,7 @@
+         if self.mode == DnsMode::FakeIp {
+             if let Some(pool) = &self.fakeip_v6 {
+                 if !self.skipper_bypasses(host) {
++                    crate::events::source("fake-ip");
+                     return LocalLookup::Decided(AddressLookupResult::Answer(
+                         pool.lookup(host),
+                         self.fakeip_ttl,
+@@ -1578,10 +1598,12 @@
+                 }
+             } else if self.fakeip_v4.is_some() && !self.skipper_bypasses(host) {
+                 // v4-only fake-ip config: suppress AAAA so clients fall back.
++                crate::events::source("fake-ip");
+                 return LocalLookup::Decided(AddressLookupResult::NoData);
+             }
+         }
+         if let Some(hit) = self.fresh_family_hit(host, QueryFamilies::IPV6) {
++            crate::events::source("cache");
+             return LocalLookup::Decided(hit);
+         }
+         LocalLookup::Upstream(host)
+@@ -1634,6 +1656,9 @@
+             } else {
+                 &cached.v6
+             };
++            if !matches!(hit, FamilyCacheHit::Miss) {
++                crate::events::source("cache");
++            }
+             match hit {
+                 FamilyCacheHit::Answer(ips, ttl) => {
+                     return AddressLookupResult::Answer(ips[0], *ttl);
+@@ -1661,6 +1686,9 @@
+                 } else {
+                     &cached.v6
+                 };
++                if !matches!(hit, FamilyCacheHit::Miss) {
++                    crate::events::source("cache");
++                }
+                 return match hit {
+                     FamilyCacheHit::Answer(ips, ttl) => AddressLookupResult::Answer(ips[0], *ttl),
+                     FamilyCacheHit::NoData => AddressLookupResult::NoData,
+@@ -1670,6 +1698,9 @@
+             }
+             return AddressLookupResult::Failed;
+         };
++        if let Some(client) = set.event_client.as_ref() {
++            crate::events::set_client(&client.0);
++        }
+         let answer = if family == QueryFamilies::IPV4 {
+             &set.v4
+         } else {
+--- a/crates/meow-dns/src/server.rs
++++ b/crates/meow-dns/src/server.rs
+@@ -112,6 +112,67 @@
+     }
+ 
+     pub async fn handle_query(
++        data: &[u8],
++        resolver: &Resolver,
++    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
++        Self::observe_query(data, resolver, crate::events::QueryUid::Known(None), None).await
++    }
++
++    pub async fn handle_query_with_timeout(
++        data: &[u8],
++        resolver: &Resolver,
++        uid: Option<u32>,
++        timeout: std::time::Duration,
++    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
++        Self::handle_query_with_deadline(
++            data,
++            resolver,
++            crate::events::QueryUid::Known(uid),
++            tokio::time::Instant::now() + timeout,
++        )
++        .await
++    }
++
++    pub async fn handle_query_with_deadline(
++        data: &[u8],
++        resolver: &Resolver,
++        uid: crate::events::QueryUid,
++        deadline: tokio::time::Instant,
++    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
++        Self::observe_query(data, resolver, uid, Some(deadline)).await
++    }
++
++    async fn observe_query(
++        data: &[u8],
++        resolver: &Resolver,
++        uid: crate::events::QueryUid,
++        deadline: Option<tokio::time::Instant>,
++    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
++        let handle = || async {
++            let query = Self::handle_query_inner(data, resolver);
++            match deadline {
++                Some(deadline) => tokio::time::timeout_at(deadline, query).await?,
++                None => query.await,
++            }
++        };
++        if !crate::events::enabled() {
++            return handle().await;
++        }
++        let start = std::time::Instant::now();
++        crate::events::ORIGIN
++            .scope(Default::default(), async {
++                let result = handle().await;
++                let timed_out = result
++                    .as_ref()
++                    .err()
++                    .is_some_and(|err| err.is::<tokio::time::error::Elapsed>());
++                crate::events::finish(start, data, result.as_deref().ok(), uid, timed_out);
++                result
++            })
++            .await
++    }
++
++    async fn handle_query_inner(
+         data: &[u8],
+         resolver: &Resolver,
+     ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+@@ -196,6 +257,7 @@
+         // rather than NXDOMAIN — clients may retry on NXDOMAIN but not on an
+         // empty-answer NOERROR response.
+         if let Some(all_ips) = resolver.lookup_hosts_all(&domain) {
++            crate::events::source("hosts");
+             // When IPv6 is disabled, an AAAA query for a hosts entry that
+             // *does* have a v6 address still returns that address — the
+             // hosts file is an explicit user override that takes priority
+@@ -226,6 +288,7 @@
+         // filtered anyway. This comes *after* the hosts check so a hosts
+         // override for the disabled family is still honored.
+         if qtype == 28 && !resolver.ipv6_enabled() {
++            crate::events::source("local");
+             return Ok(Self::build_noerror_empty(id, data, flags, question_len));
+         }
+ 
+@@ -274,6 +337,26 @@
+     /// `pub` for the TUN dns-hijack path (`meow-listener`), which answers
+     /// locally-decidable queries inline instead of spending a task spawn.
+     pub fn try_answer_local(data: &[u8], resolver: &Resolver) -> LocalAnswer {
++        if !crate::events::enabled() {
++            return Self::try_answer_local_inner(data, resolver);
++        }
++        let start = std::time::Instant::now();
++        crate::events::ORIGIN.sync_scope(Default::default(), || {
++            let outcome = Self::try_answer_local_inner(data, resolver);
++            if let LocalAnswer::Answer(response) = &outcome {
++                crate::events::finish(
++                    start,
++                    data,
++                    Some(response),
++                    crate::events::QueryUid::Known(None),
++                    false,
++                );
++            }
++            outcome
++        })
++    }
++
++    fn try_answer_local_inner(data: &[u8], resolver: &Resolver) -> LocalAnswer {
+         if data.len() < 12 {
+             return LocalAnswer::Drop; // handle_query errs — silently dropped
+         }
+@@ -329,6 +412,7 @@
+                 } else {
+                     all_ips.iter().find(|ip| ip.is_ipv6()).copied()
+                 };
++                crate::events::source("hosts");
+                 LocalAnswer::Answer(match ip {
+                     Some(addr) => Self::build_response(
+                         id,
+@@ -342,6 +426,7 @@
+                     None => Self::build_noerror_empty(id, data, flags, question_len),
+                 })
+             } else if qtype == 28 && !resolver.ipv6_enabled() {
++                crate::events::source("local");
+                 LocalAnswer::Answer(Self::build_noerror_empty(id, data, flags, question_len))
+             } else {
+                 // lookup_*_local covers the remaining local decisions:

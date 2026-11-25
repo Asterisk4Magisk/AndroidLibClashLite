@@ -123,14 +123,18 @@ async fn extend(State(extension): State<Extension>, mut request: Request, next: 
     let custom = path == "/asterisk/auto-switch";
     let capabilities = path == "/asterisk/capabilities";
     let probe = path == "/asterisk/proxy-ip-probe";
+    let dns_events = path == crate::dns_events::PATH;
     let reload = path == "/configs" && method == Method::PUT;
     let save = path == "/api/config/save" && method == Method::POST;
     let memory =
         path == "/memory" && method == Method::GET && !request.headers().contains_key("upgrade");
-    if (custom || capabilities || probe || reload || save || memory)
+    if (custom || capabilities || probe || dns_events || reload || save || memory)
         && !authorized(&request, &extension.app)
     {
         return error(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
+    if dns_events {
+        return crate::dns_events::handle(request, &extension.probe_home).await;
     }
     if probe {
         return proxy_ip_probe::handle(

@@ -6,6 +6,9 @@ mod cli;
 mod compat;
 mod compatibility;
 mod control;
+mod dns_events;
+#[cfg(target_os = "android")]
+mod dns_uid;
 mod engine;
 #[cfg(unix)]
 mod flowmeta;
