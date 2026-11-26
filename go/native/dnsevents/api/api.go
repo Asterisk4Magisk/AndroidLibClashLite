@@ -9,12 +9,15 @@ import (
 
 	"cfa/native/controlauth"
 	"cfa/native/dnsevents"
+	"cfa/native/dnsevents/owner"
 	"github.com/metacubex/chi"
 	"github.com/metacubex/http"
 	"github.com/metacubex/mihomo/hub/route"
+	"github.com/metacubex/mihomo/tunnel"
 )
 
 func init() {
+	owner.SetProcessModeReader(tunnel.FindProcessMode)
 	route.Register(func(r chi.Router) {
 		r.Get(dnsevents.Path, handle)
 	})
@@ -24,7 +27,11 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	if !controlauth.RequireLocalToken(w, r) {
 		return
 	}
-	events, unsubscribe := dnsevents.Subscribe()
+	history, events, unsubscribe, ok := dnsevents.Subscribe()
+	if !ok {
+		http.Error(w, "DNS events are unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	defer unsubscribe()
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.Header().Set("Cache-Control", "no-store")
@@ -33,6 +40,15 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	encoder := json.NewEncoder(w)
+	for _, event := range history {
+		if r.Context().Err() != nil || encoder.Encode(event) != nil {
+			return
+		}
+	}
+	if len(history) != 0 && controller.Flush() != nil {
+		return
+	}
+	history = nil
 	const flushInterval = 100 * time.Millisecond
 	timer := time.NewTimer(flushInterval)
 	timer.Stop()
@@ -47,8 +63,8 @@ func handle(w http.ResponseWriter, r *http.Request) {
 			if controller.Flush() != nil {
 				return
 			}
-		case event := <-events:
-			if encoder.Encode(event) != nil {
+		case event, ok := <-events:
+			if !ok || encoder.Encode(event) != nil {
 				return
 			}
 			if flushAt == nil {

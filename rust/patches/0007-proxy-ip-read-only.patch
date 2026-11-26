@@ -1,10 +1,39 @@
+diff --git a/crates/meow-proxy/src/group/fallback.rs b/crates/meow-proxy/src/group/fallback.rs
+index 6fc65e1..433ce3a 100644
+--- a/crates/meow-proxy/src/group/fallback.rs
++++ b/crates/meow-proxy/src/group/fallback.rs
+@@ -166,7 +166,9 @@ impl FallbackGroup {
+             // observed dead, but leaves the persistent cache untouched —
+             // here the `""` sentinel suppresses this generation's view of
+             // the stored pin without rewriting the file.
+-            self.suppress_pin_if_still(&name);
++            if !super::read_only_probe() {
++                self.suppress_pin_if_still(&name);
++            }
+         }
+         let mut fallback: Option<Arc<dyn Proxy>> = None;
+         for p in &self.static_proxies {
+diff --git a/crates/meow-proxy/src/group/load_balance.rs b/crates/meow-proxy/src/group/load_balance.rs
+index 537a797..a48c731 100644
+--- a/crates/meow-proxy/src/group/load_balance.rs
++++ b/crates/meow-proxy/src/group/load_balance.rs
+@@ -232,7 +232,7 @@ impl LoadBalanceGroup {
+                 // `advance=false` is the match-time peek (`Unwrap(metadata,
+                 // false)` upstream): round-robin reads the counter without
+                 // committing it.
+-                let c = if advance {
++                let c = if advance && !super::read_only_probe() {
+                     self.counter.fetch_add(1, Ordering::Relaxed)
+                 } else {
+                     self.counter.load(Ordering::Relaxed)
 diff --git a/crates/meow-proxy/src/group/mod.rs b/crates/meow-proxy/src/group/mod.rs
+index e7eaf4e..6c703d1 100644
 --- a/crates/meow-proxy/src/group/mod.rs
 +++ b/crates/meow-proxy/src/group/mod.rs
-@@ -17,6 +17,29 @@
+@@ -17,6 +17,29 @@ use std::time::{Duration, Instant};
  use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
  use tracing::{debug, info};
- 
+
 +tokio::task_local! {
 +    static READ_ONLY_PROBE: ();
 +}
@@ -31,32 +60,23 @@ diff --git a/crates/meow-proxy/src/group/mod.rs b/crates/meow-proxy/src/group/mo
  /// Lock-free traffic-use generation shared by automatic proxy groups. A lazy
  /// health-check loop remembers the last generation it probed and sleeps until
  /// another dial increments this counter.
-@@ -41,7 +64,7 @@
-     /// probes or a background refresh would mark a lazy child as used and
-     /// keep its own probe loop awake forever without any real traffic.
-     pub(super) fn touch_user_traffic(&self, metadata: &Metadata) {
--        if metadata.is_internal() {
-+        if metadata.is_internal() || read_only_probe() {
-             return;
-         }
-         self.touch();
-@@ -352,6 +375,7 @@
+@@ -401,6 +424,7 @@ struct DialAttempt<'a> {
      tracker: &'a DialFailureTracker,
      member: &'a Arc<dyn Proxy>,
      deadline: Option<tokio::time::Instant>,
 +    count_outcome: bool,
  }
- 
+
  impl<'a> DialAttempt<'a> {
-@@ -365,6 +389,7 @@
+@@ -414,6 +438,7 @@ impl<'a> DialAttempt<'a> {
              tracker,
              member,
              deadline: meow_common::dial::dial_deadline(),
 +            count_outcome: !read_only_probe(),
          }
      }
- 
-@@ -390,6 +415,9 @@
+
+@@ -440,6 +465,9 @@ impl<'a> DialAttempt<'a> {
              })
              .await;
          self.deadline = None;
@@ -66,8 +86,8 @@ diff --git a/crates/meow-proxy/src/group/mod.rs b/crates/meow-proxy/src/group/mo
          match &result {
              Ok(_) => self.tracker.on_success(),
              Err(err) if front_failed => debug!(
-@@ -412,9 +440,10 @@
- 
+@@ -462,9 +490,10 @@ impl<'a> DialAttempt<'a> {
+
  impl Drop for DialAttempt<'_> {
      fn drop(&mut self) {
 -        if self
@@ -80,7 +100,7 @@ diff --git a/crates/meow-proxy/src/group/mod.rs b/crates/meow-proxy/src/group/mo
          {
              let err = MeowError::Io(std::io::Error::new(
                  std::io::ErrorKind::TimedOut,
-@@ -437,7 +466,7 @@
+@@ -487,7 +516,7 @@ pub(super) fn front_hop_target(
      dial: bool,
  ) -> Option<ChainTarget> {
      let hop = crate::dialer::front_hop_for(metadata)?;
@@ -89,7 +109,7 @@ diff --git a/crates/meow-proxy/src/group/mod.rs b/crates/meow-proxy/src/group/mo
          if let Some(owner) = &hop.owner {
              health.note_owner(&hop.target, owner);
          }
-@@ -528,7 +557,7 @@
+@@ -578,7 +607,7 @@ pub(super) fn watch_front_hop(
      target: ChainTarget,
      member: &Arc<dyn Proxy>,
  ) -> Box<dyn ProxyConn> {
@@ -98,25 +118,12 @@ diff --git a/crates/meow-proxy/src/group/mod.rs b/crates/meow-proxy/src/group/mo
          return conn;
      }
      let carrier = health.carrier(&target).as_deref() == Some(member.name());
-diff --git a/crates/meow-proxy/src/group/fallback.rs b/crates/meow-proxy/src/group/fallback.rs
---- a/crates/meow-proxy/src/group/fallback.rs
-+++ b/crates/meow-proxy/src/group/fallback.rs
-@@ -120,7 +120,9 @@
-             }
-             // Upstream clears a stale fallback pin in memory when it is
-             // observed dead, but leaves the persistent cache untouched.
--            *self.fixed.write() = None;
-+            if !super::read_only_probe() {
-+                *self.fixed.write() = None;
-+            }
-         }
-         let mut fallback: Option<Arc<dyn Proxy>> = None;
-         for p in &self.static_proxies {
 diff --git a/crates/meow-proxy/src/group/urltest.rs b/crates/meow-proxy/src/group/urltest.rs
+index 559c42f..ddf42af 100644
 --- a/crates/meow-proxy/src/group/urltest.rs
 +++ b/crates/meow-proxy/src/group/urltest.rs
-@@ -187,12 +187,16 @@
- 
+@@ -209,12 +209,16 @@ impl UrlTestGroup {
+
          if let Some(bp) = best_proxy.as_ref() {
              if best_delay.saturating_add(self.tolerance) < current_delay || !current_alive {
 -                *self.fastest.write() = Some(SmolStr::from(bp.name()));
@@ -134,24 +141,13 @@ diff --git a/crates/meow-proxy/src/group/urltest.rs b/crates/meow-proxy/src/grou
              return fb;
          }
          current_proxy.or(best_proxy).or(first_any)
-diff --git a/crates/meow-proxy/src/group/load_balance.rs b/crates/meow-proxy/src/group/load_balance.rs
---- a/crates/meow-proxy/src/group/load_balance.rs
-+++ b/crates/meow-proxy/src/group/load_balance.rs
-@@ -232,7 +232,7 @@
-                 // `advance=false` is the match-time peek (`Unwrap(metadata,
-                 // false)` upstream): round-robin reads the counter without
-                 // committing it.
--                let c = if advance {
-+                let c = if advance && !super::read_only_probe() {
-                     self.counter.fetch_add(1, Ordering::Relaxed)
-                 } else {
-                     self.counter.load(Ordering::Relaxed)
 diff --git a/crates/meow-proxy/src/reject.rs b/crates/meow-proxy/src/reject.rs
+index c07323f..b7e1831 100644
 --- a/crates/meow-proxy/src/reject.rs
 +++ b/crates/meow-proxy/src/reject.rs
-@@ -130,6 +130,14 @@
+@@ -130,6 +130,14 @@ impl ProxyAdapter for RejectAdapter {
      }
- 
+
      async fn dial_tcp(&self, _metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
 +        if crate::group::read_only_probe()
 +            && matches!(
@@ -164,9 +160,9 @@ diff --git a/crates/meow-proxy/src/reject.rs b/crates/meow-proxy/src/reject.rs
          if self.drop {
              // Sleep for a long time to simulate DROP behavior
              tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-@@ -138,6 +146,14 @@
+@@ -138,6 +146,14 @@ impl ProxyAdapter for RejectAdapter {
      }
- 
+
      async fn dial_udp(&self, _metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
 +        if crate::group::read_only_probe()
 +            && matches!(
@@ -178,4 +174,4 @@ diff --git a/crates/meow-proxy/src/reject.rs b/crates/meow-proxy/src/reject.rs
 +        }
          Ok(Box::new(RejectPacketConn))
      }
- 
+

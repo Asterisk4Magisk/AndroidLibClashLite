@@ -24,18 +24,18 @@ pub(crate) async fn handle(request: Request, home: &Path) -> Response {
         )
             .into_response();
     }
-    let stream = futures::stream::unfold(
-        meow_dns::events::subscribe(),
-        |mut subscription| async move {
-            loop {
-                let event = subscription.recv().await?;
-                if let Ok(mut line) = serde_json::to_vec(event.as_ref()) {
-                    line.push(b'\n');
-                    return Some((Ok::<_, Infallible>(line), subscription));
-                }
+    let Some(subscription) = meow_dns::events::subscribe() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let stream = futures::stream::unfold(subscription, |mut subscription| async move {
+        loop {
+            let event = subscription.recv().await?;
+            if let Ok(mut line) = serde_json::to_vec(event.as_ref()) {
+                line.push(b'\n');
+                return Some((Ok::<_, Infallible>(line), subscription));
             }
-        },
-    );
+        }
+    });
     Response::builder()
         .header("content-type", "application/x-ndjson")
         .header("cache-control", "no-store")

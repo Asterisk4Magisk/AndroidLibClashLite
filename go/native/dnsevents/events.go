@@ -38,34 +38,50 @@ type Event struct {
 	OutboundTag  string    `json:"outboundTag,omitempty"`
 	UID          *uint32   `json:"uid,omitempty"`
 	UIDSource    string    `json:"uidSource,omitempty"`
-	wireAnswers  []D.RR
-	origin       Origin
-	lookupUID    func() (uint32, bool)
 }
 
-func (e Event) format() Event {
+type pendingEvent struct {
+	Event
+	wireAnswers []D.RR
+	origin      Origin
+	lookupUID   func() (uint32, bool)
+}
+
+func (e pendingEvent) format() Event {
 	if e.Rcode != nil {
 		answers := make([]answer, 0, len(e.wireAnswers))
 		for _, record := range e.wireAnswers {
 			header := record.Header()
-			data := strings.TrimSpace(strings.TrimPrefix(record.String(), header.String()))
+			data := answerData(record)
 			answers = append(answers, answer{Name: header.Name, Type: header.Rrtype, Data: data})
 		}
 		e.Answers = &answers
 	}
 	e.Upstream = e.origin.upstreamAddress()
-	if e.UID == nil && e.lookupUID != nil {
-		if uid, ok := e.lookupUID(); ok {
-			e.UID = &uid
-		}
-	}
 	if e.UID != nil {
 		e.UIDSource = "socket"
 	}
-	e.wireAnswers = nil
-	e.origin = Origin{}
-	e.lookupUID = nil
-	return e
+	return e.Event
+}
+
+func answerData(record D.RR) string {
+	switch record := record.(type) {
+	case *D.A:
+		if record.A == nil {
+			return ""
+		}
+		return record.A.String()
+	case *D.AAAA:
+		if record.AAAA == nil {
+			return ""
+		}
+		if record.AAAA.To4() != nil {
+			return "::ffff:" + record.AAAA.String()
+		}
+		return record.AAAA.String()
+	default:
+		return strings.TrimSpace(strings.TrimPrefix(record.String(), record.Header().String()))
+	}
 }
 
 type Origin struct {
@@ -95,6 +111,7 @@ type Observation struct {
 }
 
 var active atomic.Pointer[eventQueue]
+var subscribed atomic.Bool
 var stream = struct {
 	sync.Mutex
 	seq       uint64
@@ -103,26 +120,47 @@ var stream = struct {
 
 func Enabled() bool { return active.Load() != nil }
 
-func Subscribe() (<-chan Event, func()) {
-	listener := make(chan Event, eventQueueCapacity)
+func HasSubscribers() bool { return subscribed.Load() }
+
+func StartCollection() {
 	stream.Lock()
-	stream.listeners[listener] = struct{}{}
+	defer stream.Unlock()
 	if active.Load() == nil {
 		queue := newEventQueue()
 		active.Store(queue)
 		go queue.run(publish)
 	}
-	stream.Unlock()
-	return listener, func() {
+}
+
+func StopCollection() {
+	stream.Lock()
+	defer stream.Unlock()
+	if queue := active.Swap(nil); queue != nil {
+		close(queue.done)
+	}
+	for listener := range stream.listeners {
+		close(listener)
+	}
+	clear(stream.listeners)
+	subscribed.Store(false)
+}
+
+func Subscribe() ([]Event, <-chan Event, func(), bool) {
+	stream.Lock()
+	defer stream.Unlock()
+	queue := active.Load()
+	if queue == nil {
+		return nil, nil, nil, false
+	}
+	listener := make(chan Event, eventQueueCapacity)
+	stream.listeners[listener] = struct{}{}
+	subscribed.Store(true)
+	return queue.snapshot(), listener, func() {
 		stream.Lock()
 		delete(stream.listeners, listener)
-		if len(stream.listeners) == 0 {
-			if queue := active.Swap(nil); queue != nil {
-				close(queue.done)
-			}
-		}
+		subscribed.Store(len(stream.listeners) != 0)
 		stream.Unlock()
-	}
+	}, true
 }
 
 func WithUID(ctx context.Context, uid uint32) context.Context {
@@ -189,11 +227,14 @@ func (o *Observation) Finish(query *D.Msg, response *D.Msg, err error) {
 	}
 	now := time.Now()
 	q := query.Question[0]
-	event := Event{
-		Time: now.UnixMilli(), Delay: now.Sub(o.start).Milliseconds(),
-		Qname: q.Name, Qtype: q.Qtype, Status: "failed", UID: o.uid,
-		AnswerSource: o.origin.Source, origin: o.origin, lookupUID: o.lookupUID,
-		Route: o.origin.Route, OutboundTag: o.origin.OutboundTag,
+	event := pendingEvent{
+		Event: Event{
+			Time: now.UnixMilli(), Delay: now.Sub(o.start).Milliseconds(),
+			Qname: q.Name, Qtype: q.Qtype, Status: "failed", UID: o.uid,
+			AnswerSource: o.origin.Source, Route: o.origin.Route, OutboundTag: o.origin.OutboundTag,
+		},
+		origin:    o.origin,
+		lookupUID: o.lookupUID,
 	}
 	if response != nil {
 		event.Status = "answered"
@@ -215,6 +256,7 @@ func publish(queue *eventQueue, event Event) {
 	}
 	stream.seq++
 	event.Seq = stream.seq
+	queue.remember(event)
 	for listener := range stream.listeners {
 		sendLatest(listener, event)
 	}

@@ -57,7 +57,7 @@ func QuerySocketUid(source, target net.Addr) int {
 			if protocol == syscall.IPPROTO_UDP {
 				network = "udp"
 			}
-			uid, e := flowmeta.FindUID(network, src.Addr().String(), src.Port(), dst.Addr().String(), dst.Port())
+			uid, e := flowmeta.FindUID(network, src, dst)
 			if e != nil {
 				return -1
 			}

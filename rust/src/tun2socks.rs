@@ -237,8 +237,8 @@ async fn run_tun2socks(
                             let handle = tokio::spawn(async move {
                                 if hijack {
                                     if let Some(tunnel) = engine::tunnel() {
-                                        let owner = tcp_dns_owner(local_addr, remote_addr);
-                                        let _ = meow_config::dns_outbound::serve_tcp_with_uid_lookup(
+                                        let owner = tcp_dns_owner(tunnel.clone(), local_addr, remote_addr);
+                                        let _ = meow_dns::server::serve_tcp_with_uid_lookup(
                                             stream, tunnel.resolver_slot(), owner,
                                         ).await;
                                     }
@@ -266,7 +266,7 @@ async fn run_tun2socks(
                                     };
                                     if let Some(tunnel) = engine::tunnel() {
                                         let deadline = Instant::now() + DNS_TASK_TIMEOUT;
-                                        let uid = pending_dns_uid(src, dst, deadline);
+                                        let uid = pending_dns_uid(tunnel.inner(), src, dst, deadline);
                                         if let Ok(response) = DnsServer::handle_query_with_deadline(
                                             &payload, &tunnel.resolver(), uid, deadline,
                                         ).await {
@@ -406,20 +406,38 @@ async fn abort_flow_tasks(flow_tasks: &FlowTasks) {
 
 static DNS_UID_BUDGET: Semaphore = Semaphore::const_new(DNS_BURST_CAP);
 
-fn tcp_dns_owner(source: SocketAddr, destination: SocketAddr) -> impl FnMut() -> QueryUid {
-    let mut connection: Option<tokio::sync::watch::Receiver<Option<Option<u32>>>> = None;
+fn tcp_dns_owner(
+    tunnel: meow_tunnel::Tunnel,
+    source: SocketAddr,
+    destination: SocketAddr,
+) -> impl FnMut() -> QueryUid {
+    const RETRY_DELAY: Duration = Duration::from_millis(250);
+    let mut connection: Option<(tokio::sync::watch::Receiver<Option<Option<u32>>>, Instant)> = None;
     move || {
-        if !meow_dns::events::enabled() {
+        if !owner::process_lookup_enabled() {
             return QueryUid::Known(None);
         }
-        if let Some(receiver) = &connection {
-            return QueryUid::Connection(receiver.clone());
+        if let Some((receiver, _)) = &connection {
+            if let Some(Some(uid)) = *receiver.borrow() {
+                return QueryUid::Known(Some(uid));
+            }
+        }
+        if !meow_dns::events::has_subscribers() || !owner::needs_owner(tunnel.inner()) {
+            return QueryUid::Known(None);
+        }
+        if let Some((receiver, started)) = &connection {
+            if receiver.borrow().is_none() {
+                return QueryUid::Connection(receiver.clone());
+            }
+            if started.elapsed() < RETRY_DELAY {
+                return QueryUid::Known(None);
+            }
         }
         let Ok(permit) = DNS_UID_BUDGET.try_acquire() else {
             return QueryUid::Known(None);
         };
         let (sender, receiver) = tokio::sync::watch::channel(None);
-        connection = Some(receiver.clone());
+        connection = Some((receiver.clone(), Instant::now()));
         tokio::spawn(async move {
             let _permit = permit;
             let uid = owner::lookup_uid(owner::IPPROTO_TCP, source, destination).await;
@@ -429,8 +447,13 @@ fn tcp_dns_owner(source: SocketAddr, destination: SocketAddr) -> impl FnMut() ->
     }
 }
 
-fn pending_dns_uid(source: SocketAddr, destination: SocketAddr, deadline: Instant) -> QueryUid {
-    if !meow_dns::events::enabled() {
+fn pending_dns_uid(
+    tunnel: &meow_tunnel::tunnel::TunnelInner,
+    source: SocketAddr,
+    destination: SocketAddr,
+    deadline: Instant,
+) -> QueryUid {
+    if !meow_dns::events::has_subscribers() || !owner::needs_owner(tunnel) {
         return QueryUid::Known(None);
     }
     let Ok(permit) = DNS_UID_BUDGET.try_acquire() else {

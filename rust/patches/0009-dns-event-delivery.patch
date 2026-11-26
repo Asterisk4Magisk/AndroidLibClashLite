@@ -1,83 +1,5 @@
-diff --git a/crates/meow-config/src/dns_outbound.rs b/crates/meow-config/src/dns_outbound.rs
-index da69350..27f38c1 100644
---- a/crates/meow-config/src/dns_outbound.rs
-+++ b/crates/meow-config/src/dns_outbound.rs
-@@ -3,7 +3,7 @@ use async_trait::async_trait;
- use meow_common::adapter::ProxyHealth;
- use meow_common::error::{MeowError, Result};
- use meow_common::{AdapterType, Metadata, ProxyAdapter, ProxyConn, ProxyPacketConn};
--use meow_dns::{DnsServer, ResolverSlot};
-+use meow_dns::{events::QueryUid, DnsServer, ResolverSlot};
- use std::{
-     io,
-     net::SocketAddr,
-@@ -18,13 +18,13 @@ pub async fn serve_tcp<S: AsyncRead + AsyncWrite + Unpin>(
-     stream: S,
-     slot: ResolverSlot,
- ) -> io::Result<()> {
--    serve_tcp_with_uid(stream, slot, None).await
-+    serve_tcp_with_uid_lookup(stream, slot, || QueryUid::Known(None)).await
- }
- 
--pub async fn serve_tcp_with_uid<S: AsyncRead + AsyncWrite + Unpin>(
-+pub async fn serve_tcp_with_uid_lookup<S: AsyncRead + AsyncWrite + Unpin>(
-     mut stream: S,
-     slot: ResolverSlot,
--    uid: Option<u32>,
-+    mut owner: impl FnMut() -> QueryUid,
- ) -> io::Result<()> {
-     loop {
-         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-@@ -36,17 +36,13 @@ pub async fn serve_tcp_with_uid<S: AsyncRead + AsyncWrite + Unpin>(
-         })
-         .await??;
-         let resolver = slot.read().clone();
--        let response = DnsServer::handle_query_with_deadline(
--            &query,
--            &resolver,
--            meow_dns::events::QueryUid::Known(uid),
--            deadline,
--        )
--        .await
--        .map_err(|err| {
--            err.downcast::<tokio::time::error::Elapsed>()
--                .map_or_else(io::Error::other, |elapsed| io::Error::from(*elapsed))
--        })?;
-+        let response =
-+            DnsServer::handle_query_with_deadline(&query, &resolver, owner(), deadline)
-+                .await
-+                .map_err(|err| {
-+                    err.downcast::<tokio::time::error::Elapsed>()
-+                        .map_or_else(io::Error::other, |elapsed| io::Error::from(*elapsed))
-+                })?;
-         tokio::time::timeout_at(deadline, async {
-             let size = u16::try_from(response.len()).map_err(io::Error::other)?;
-             stream.write_u16(size).await?;
-@@ -98,7 +94,7 @@ impl ProxyAdapter for DnsAdapter {
-         let (client, server) = tokio::io::duplex(65536);
-         let uid = metadata.uid;
-         let task = tokio::spawn(async move {
--            let _ = serve_tcp_with_uid(server, slot, uid).await;
-+            let _ = serve_tcp_with_uid_lookup(server, slot, || QueryUid::Known(uid)).await;
-         });
-         Ok(Box::new(DnsStream {
-             stream: client,
-@@ -180,8 +176,11 @@ impl ProxyPacketConn for DnsPacket {
-         tokio::select! {
-             _ = closed.wait_for(|v| *v) => Err(io::Error::from(io::ErrorKind::BrokenPipe).into()),
-             result = async {
--                let response = DnsServer::handle_query_with_timeout(buf, &resolver, self.uid, Duration::from_secs(5))
--                    .await.map_err(io::Error::other)?;
-+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-+                let response = DnsServer::handle_query_with_deadline(
-+                    buf, &resolver, QueryUid::Known(self.uid), deadline,
-+                )
-+                .await.map_err(io::Error::other)?;
-                 self.tx.send((response, *addr)).await.map_err(io::Error::other)?;
-                 Ok(buf.len())
-             } => result,
 diff --git a/crates/meow-dns/src/events.rs b/crates/meow-dns/src/events.rs
-index 9f4b833..17c7411 100644
+index eaf5760..84ebe94 100644
 --- a/crates/meow-dns/src/events.rs
 +++ b/crates/meow-dns/src/events.rs
 @@ -11,13 +11,13 @@ use std::{
@@ -97,11 +19,11 @@ index 9f4b833..17c7411 100644
 +    sync::{broadcast, mpsc, oneshot, watch, Semaphore},
      time,
  };
- 
+
 @@ -47,7 +47,7 @@ pub(crate) struct Origin {
      pub outbound_tag: Option<String>,
  }
- 
+
 -#[derive(Clone, Serialize)]
 +#[derive(Serialize)]
  struct Answer {
@@ -110,7 +32,7 @@ index 9f4b833..17c7411 100644
 @@ -55,7 +55,7 @@ struct Answer {
      data: String,
  }
- 
+
 -#[derive(Clone, Serialize)]
 +#[derive(Serialize)]
  #[serde(rename_all = "camelCase")]
@@ -146,16 +68,16 @@ index 9f4b833..17c7411 100644
 +static FEED: Mutex<Option<Feed>> = Mutex::new(None);
  static SUBSCRIBERS: AtomicUsize = AtomicUsize::new(0);
 +static SEQUENCE: AtomicU64 = AtomicU64::new(0);
- 
+
  pub fn enabled() -> bool {
      SUBSCRIBERS.load(Ordering::Relaxed) != 0
  }
- 
+
  pub struct Subscription {
 -    receiver: broadcast::Receiver<Event>,
 +    receiver: broadcast::Receiver<Arc<Event>>,
  }
- 
+
  impl Subscription {
 -    pub async fn recv(&mut self) -> Option<Event> {
 +    pub async fn recv(&mut self) -> Option<Arc<Event>> {
@@ -163,7 +85,7 @@ index 9f4b833..17c7411 100644
              match self.receiver.recv().await {
                  Ok(event) => return Some(event),
 @@ -106,12 +125,16 @@ impl Subscription {
- 
+
  impl Drop for Subscription {
      fn drop(&mut self) {
 -        SUBSCRIBERS.fetch_sub(1, Ordering::Relaxed);
@@ -173,7 +95,7 @@ index 9f4b833..17c7411 100644
 +        }
      }
  }
- 
+
  pub fn subscribe() -> Subscription {
 -    let receiver = FEED.lock().expect("DNS event feed").1.subscribe();
 +    let mut feed = FEED.lock().expect("DNS event feed");
@@ -410,16 +332,16 @@ index 9f4b833..17c7411 100644
 +        uid_source: uid.map(|_| "socket"),
 +    })
  }
- 
+
  fn record_data(data: &RData) -> String {
 diff --git a/crates/meow-dns/src/server.rs b/crates/meow-dns/src/server.rs
-index 33adcc5..27cad6f 100644
+index 6c8c28e..bb2878c 100644
 --- a/crates/meow-dns/src/server.rs
 +++ b/crates/meow-dns/src/server.rs
-@@ -118,21 +118,6 @@ impl DnsServer {
-         Self::observe_query(data, resolver, crate::events::QueryUid::Known(None), None).await
+@@ -237,21 +237,6 @@ impl DnsServer {
+         Self::observe_query(data, resolver, crate::events::QueryUid::Known(None), None, charge).await
      }
- 
+
 -    pub async fn handle_query_with_timeout(
 -        data: &[u8],
 -        resolver: &Resolver,
@@ -438,7 +360,7 @@ index 33adcc5..27cad6f 100644
      pub async fn handle_query_with_deadline(
          data: &[u8],
          resolver: &Resolver,
-@@ -155,10 +140,9 @@ impl DnsServer {
+@@ -275,14 +260,13 @@ impl DnsServer {
                  None => query.await,
              }
          };
@@ -446,12 +368,16 @@ index 33adcc5..27cad6f 100644
 +        let Some(observation) = crate::events::begin() else {
              return handle().await;
 -        }
--        let start = std::time::Instant::now();
 +        };
+         let uid = match uid {
+             crate::events::QueryUid::Known(None) => crate::events::QueryUid::Known(crate::events::outbound_uid()),
+             uid => uid,
+         };
+-        let start = std::time::Instant::now();
          crate::events::ORIGIN
              .scope(Default::default(), async {
                  let result = handle().await;
-@@ -166,7 +150,7 @@ impl DnsServer {
+@@ -290,7 +274,7 @@ impl DnsServer {
                      .as_ref()
                      .err()
                      .is_some_and(|err| err.is::<tokio::time::error::Elapsed>());
@@ -460,7 +386,7 @@ index 33adcc5..27cad6f 100644
                  result
              })
              .await
-@@ -337,15 +321,14 @@ impl DnsServer {
+@@ -500,15 +484,14 @@ impl DnsServer {
      /// `pub` for the TUN dns-hijack path (`meow-listener`), which answers
      /// locally-decidable queries inline instead of spending a task spawn.
      pub fn try_answer_local(data: &[u8], resolver: &Resolver) -> LocalAnswer {
@@ -478,4 +404,4 @@ index 33adcc5..27cad6f 100644
 +                    observation,
                      data,
                      Some(response),
-                     crate::events::QueryUid::Known(None),
+                     crate::events::QueryUid::Known(crate::events::outbound_uid()),

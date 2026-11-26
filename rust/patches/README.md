@@ -12,18 +12,16 @@ Keep this ordering when adding or renumbering patches.
 - `0001-android-lwip-errno.patch`: selects LwIP's direct system errno include on
   Android, preventing an existing `errno` macro from expanding inside the
   indirect header name with newer NDK headers.
-- `0002-android-system-dns.patch`: adds a dynamic `system` nameserver transport, shares
-  physical-network snapshots with bootstrap/ECH DNS, invalidates DNS caches and
-  pooled connections after updates, and selects the proper UDP socket family.
-  DNS wire encoding, validation, TCP truncation fallback and routing stay upstream.
-- `0003-android-tproxy.patch`: enables the Android listener path, obtains the original
-  TCP destination from the accepted transparent socket, extends UDP address and
-  ancillary handling to IPv6, and maps Android `tproxy-port` to an externally
-  managed TCP+UDP listener. Relay, sniffing, flow control and UDP sessions remain
-  upstream implementations. The same Android integration patch adds a `dns`
-  outbound backed by the live resolver, ROOT UID/package lookup, externally
-  managed named-listener firewall defaults, and subscription redirect/HWID
-  handling through the existing HTTP transport.
+- `0002-android-system-dns.patch`: adds a dynamic `system` nameserver transport,
+  shares physical-network snapshots with bootstrap/ECH DNS, and invalidates DNS
+  caches and pooled connections after updates. The upstream DNS client selects
+  the UDP socket family and handles DNS wire encoding, validation and fallback.
+- `0003-android-tproxy.patch`: enables Android's use of the upstream transparent
+  TCP listener, extends UDP address and ancillary handling to IPv6, and maps
+  Android `tproxy-port` to an externally managed TCP+UDP listener. It adds ROOT
+  UID/package lookup, externally managed named-listener firewall defaults,
+  and the Android subscription redirect and HWID policies to the upstream HTTP
+  client.
 - `0004-global-proxy-order.patch`: preserves Mihomo's GLOBAL member order (DIRECT,
   REJECT, declared proxies, declared groups) independently of dependency build
   order. The primary outbound remains the default without moving it in the list;
@@ -36,11 +34,16 @@ Keep this ordering when adding or renumbering patches.
   existing lookup policy and authoritative unknown results also apply here.
 - `0007-proxy-ip-read-only.patch` lets exit-IP probes use the existing group
   selection logic without updating group usage, selection, or health state.
-- `0008-dns-events.patch` observes completed DNS responses and preserves the
-  source of the selected reply across the resolver pipeline.
+- `0008-dns-events.patch` observes completed DNS responses, preserves the
+  source of the selected reply and carries flow UIDs into the upstream DNS
+  outbound.
 - `0009-dns-event-delivery.patch` queues event formatting and UID lookups
-  separately from DNS replies while the controller has a subscriber.
-  In-flight UID lookups use a bounded wait outside the formatting worker.
+  separately from DNS replies. In-flight UID lookups use a bounded wait
+  outside the formatting worker.
+- `0010-dns-event-history.patch` retains the latest 1,000 events in memory
+  during the core session and replays them before live events. It reuses
+  parsed questions for simple address queries and publishes deferred UID
+  results directly to the same history and live feed.
 
 Preparation checks every patch against the pinned sources before applying it.
 When updating the pin, review and regenerate these patches, then run the Android

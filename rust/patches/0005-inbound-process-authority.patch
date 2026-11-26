@@ -1,6 +1,8 @@
+diff --git a/crates/meow-common/src/metadata.rs b/crates/meow-common/src/metadata.rs
+index 66cd21f..3050da1 100644
 --- a/crates/meow-common/src/metadata.rs
 +++ b/crates/meow-common/src/metadata.rs
-@@ -30,6 +30,9 @@
+@@ -34,6 +34,9 @@ pub struct Metadata {
      #[serde(rename = "processPath")]
      pub process_path: SmolStr,
      pub uid: Option<u32>,
@@ -10,7 +12,7 @@
      /// DSCP marking from the IP header (6 bits, 0–63).
      ///
      /// `Some(n)` — set by the TProxy listener from the `IP_RECVTOS` cmsg
-@@ -157,6 +160,7 @@
+@@ -313,6 +316,7 @@ impl Default for Metadata {
              process: SmolStr::default(),
              process_path: SmolStr::default(),
              uid: None,
@@ -18,7 +20,7 @@
              dscp: None,
              src_geo_ip: Vec::new(),
              dst_geo_ip: Vec::new(),
-@@ -293,6 +297,7 @@
+@@ -471,6 +475,7 @@ impl Metadata {
              process: self.process.clone(),
              process_path: self.process_path.clone(),
              uid: self.uid,
@@ -26,29 +28,11 @@
              dscp: self.dscp,
              src_geo_ip: Vec::new(),
              dst_geo_ip: Vec::new(),
---- a/crates/meow-tunnel/src/match_engine.rs
-+++ b/crates/meow-tunnel/src/match_engine.rs
-@@ -239,7 +239,7 @@
- /// scan runs on the blocking pool so a large `/proc` table cannot stall the
- /// Tokio worker the match executes on (issue #515).
- pub async fn maybe_enrich_with_process_async(metadata: &Metadata) -> Option<Metadata> {
--    if !metadata.process.is_empty() {
-+    if metadata.process_info_complete || !metadata.process.is_empty() {
-         return None;
-     }
-     let src_ip = metadata.src_ip?;
-@@ -256,7 +256,7 @@
- /// socket scan can walk a large `/proc` tree and would stall the Tokio
- /// worker this runs on (issue #515).
- pub fn maybe_enrich_with_process(metadata: &Metadata) -> Option<Metadata> {
--    if !metadata.process.is_empty() {
-+    if metadata.process_info_complete || !metadata.process.is_empty() {
-         return None;
-     }
-     let src_ip = metadata.src_ip?;
+diff --git a/crates/meow-tunnel/src/app_lookup.rs b/crates/meow-tunnel/src/app_lookup.rs
+index 6ae85d5..4a2adb2 100644
 --- a/crates/meow-tunnel/src/app_lookup.rs
 +++ b/crates/meow-tunnel/src/app_lookup.rs
-@@ -37,7 +37,7 @@
+@@ -47,7 +47,7 @@ static LOOKUPS: OnceLock<Option<SyncSender<Lookup>>> = OnceLock::new();
  /// address, or through an inbound that also carries other hosts' traffic,
  /// where the lookup thread checks the source address first.
  pub(crate) fn local_socket(metadata: &Metadata) -> Option<SocketAddr> {

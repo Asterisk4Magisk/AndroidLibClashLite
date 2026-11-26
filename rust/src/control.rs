@@ -41,19 +41,17 @@ pub fn router(
     probe_home: PathBuf,
 ) -> Router {
     let startup = Arc::new(app.raw_config.read().clone());
-    meow_api::routes::create_router(app.clone())
-        .layer(middleware::from_fn_with_state(
-            Extension {
-                app,
-                autoswitch,
-                startup,
-                controller_unix,
-                probe_runtime,
-                probe_home,
-            },
-            extend,
-        ))
-        .layer(tower_http::cors::CorsLayer::permissive())
+    meow_api::routes::create_router(app.clone()).layer(middleware::from_fn_with_state(
+        Extension {
+            app,
+            autoswitch,
+            startup,
+            controller_unix,
+            probe_runtime,
+            probe_home,
+        },
+        extend,
+    ))
 }
 
 fn error(status: StatusCode, message: impl ToString) -> Response {
@@ -93,6 +91,7 @@ fn restart_fields(
     let new = serde_json::to_value(candidate)?;
     for field in [
         "external-controller",
+        "external-controller-cors",
         "secret",
         "external-ui",
         "external-ui-name",

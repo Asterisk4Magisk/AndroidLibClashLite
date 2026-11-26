@@ -16,6 +16,7 @@ import (
 	"cfa/native/autoswitch"
 	"cfa/native/config"
 	"cfa/native/delegate"
+	"cfa/native/dnsevents"
 	"cfa/native/profilecache"
 	"cfa/native/tunnel"
 
@@ -59,6 +60,7 @@ func NotifyInstalledAppsChanged(uidList string) {
 }
 
 func Reset() {
+	dnsevents.StopCollection()
 	autoswitch.ClearOverride()
 	config.LoadDefault()
 	tunnel.ResetStatistic()

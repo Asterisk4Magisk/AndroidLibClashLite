@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"cfa/native/app"
+	"cfa/native/dnsevents"
 
 	"github.com/metacubex/mihomo/common/yaml"
 	"github.com/metacubex/mihomo/config"
@@ -116,6 +117,7 @@ func applyProfile(path string, rawCfg *config.RawConfig, err error, apply func(*
 		return err
 	}
 
+	dnsevents.StartCollection()
 	apply(cfg)
 
 	app.ApplySubtitlePattern(rawCfg.ClashForAndroid.UiSubtitlePattern)

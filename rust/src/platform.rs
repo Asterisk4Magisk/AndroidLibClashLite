@@ -18,6 +18,10 @@ mod socket_owner;
 pub(crate) fn configure_process_mode(mode: &str) {
     demand::configure(mode);
 }
+pub(crate) fn process_lookup_enabled() -> bool {
+    demand::enabled()
+}
+
 pub(crate) fn needs_owner(inner: &meow_tunnel::tunnel::TunnelInner) -> bool {
     demand::needed(inner)
 }

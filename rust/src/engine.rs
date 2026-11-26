@@ -155,6 +155,7 @@ fn start_inner(
         let config = meow_config::build_config(raw, Some(Path::new(base))).await?;
         meow_api::ensure_listeners_supported(&config.listeners.named, crate::listeners::supported)?;
         crate::platform::configure_process_mode(&process_mode);
+        meow_dns::events::start_collection(crate::platform::process_lookup_enabled());
         let mut session = start_config(
             Path::new(home),
             config,
@@ -194,11 +195,18 @@ async fn start_config(
     meow_common::logbook::apply(config.general.logbook);
     let _ = meow_api::log_stream::reload_log_level(&config.general.log_level);
     let tunnel = Tunnel::new_with_slot(Arc::clone(&config.dns.resolver_slot));
+    tunnel.set_selection_backing(Arc::clone(&config.selection));
+    tunnel.set_dns_outbound_cell(Arc::clone(&config.provider_dns_cell));
     tunnel.set_dialer_registry(config.provider_dialer_registry.clone());
     tunnel.set_mode(config.general.mode);
     tunnel.set_connection_notes(config.general.connection_notes);
     tunnel.set_tcp_idle_timeout(config.general.tcp_idle_timeout);
-    tunnel.update_routing(config.proxies, config.rules, config.dialer_registry);
+    tunnel.update_routing(
+        config.proxies,
+        config.rules,
+        config.sub_rules,
+        config.dialer_registry,
+    );
     tunnel.spawn_background_tasks();
     tunnel.reconcile_health_checks(&meow_config::extract_health_check_specs(
         config.raw.proxy_groups.as_deref().unwrap_or(&[]),
@@ -225,6 +233,7 @@ async fn start_config(
             .bind()
             .await
             .map_err(|e| anyhow::anyhow!("DNS bind: {e}"))?;
+        let socket = bound.socket_weak();
         let task = tokio::spawn(async move {
             if let Err(e) = bound.run().await {
                 tracing::error!("DNS server stopped: {e}");
@@ -234,6 +243,7 @@ async fn start_config(
             listen: address,
             task,
             resolver_slot,
+            socket: Some(socket),
         });
     }
     let sniffer = Arc::new(SnifferRuntime::new(config.sniffer));
@@ -270,6 +280,9 @@ async fn start_config(
         external_ui: config.api.external_ui,
         traffic_feed: Default::default(),
         dns_server: dns_handle,
+        ntp_reconcile: None,
+        ui_storage: Default::default(),
+        cors: config.api.cors,
     });
     let autoswitch = crate::autoswitch::Service::new(app.tunnel.clone());
     let (probe_runtime, _) =
@@ -412,6 +425,7 @@ pub fn stop() {
         meow_common::logbook::engine_stopped(meow_common::logbook::Stop::Requested("stop"));
         drop(session);
     }
+    meow_dns::events::stop_collection();
     // Dropping this session's runtime aborts/joins even upstream detached workers.
     crate::drop_runtime();
     meow_common::clear_host_resolver();

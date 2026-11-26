@@ -23,6 +23,10 @@ pub(super) fn configure(mode: &str) {
     );
 }
 
+pub(super) fn enabled() -> bool {
+    MODE.load(Ordering::Relaxed) != 0
+}
+
 pub(super) fn needed(inner: &meow_tunnel::tunnel::TunnelInner) -> bool {
     match MODE.load(Ordering::Relaxed) {
         0 => return false,

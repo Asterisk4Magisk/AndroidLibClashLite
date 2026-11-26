@@ -121,15 +121,19 @@ loopback controller. Send the usual controller credentials and
   with an `outboundTag` and an HTTPS `url`. The core uses the group's
   current selection logic and returns `status` and, on success, the endpoint's
   response body in `response`.
-- **DNS events** (`dnsEvents: 1`). Open `GET /asterisk/dns-events` for live
-  NDJSON. Each event has `seq`, `time`, `delay`, `qname`, `qtype` and
-  `status`. Times are in milliseconds. Replies add `rcode` and `answers`.
+- **DNS events** (`dnsEvents: 1`). Open `GET /asterisk/dns-events` for
+  NDJSON. The stream replays up to 1,000 recent events from the running core,
+  oldest first, then sends live events. Each event has `seq`, `time`,
+  `delay`, `qname`, `qtype` and `status`. Times are in milliseconds.
+  Replies add `rcode` and `answers`.
   A timed-out Mihomo query can include the SERVFAIL reply's `rcode`.
   `answerSource`, `upstream`, `uid`, `uidSource`, `route` and `outboundTag`
   are optional. `uidSource` is `socket` when connection ownership supplies a UID.
-  Open the stream only while collecting.
-  Delivery is best effort and events can be dropped under load. Mihomo limits
-  its event answer list to 64 records or 8 KiB of uncompressed DNS record data.
+  UID attribution follows the core's `find-process-mode`. Background
+  history uses existing connection metadata. Live UID lookups use a bounded
+  wait and events can be published without a UID. Open the stream only while
+  collecting. Delivery is best effort. Mihomo limits answers to 64 records
+  or 8 KiB of uncompressed DNS record data.
 
 ## Standalone CLI
 

@@ -214,7 +214,7 @@ pub extern "system" fn Java_libclash_NativeBridge_startTunWithDns(
     fd: jint,
     dns: JString,
 ) {
-    boundary(&mut env, |env| {
+    boundary(&mut env, |env| -> Result<()> {
         anyhow::ensure!(
             crate::engine::is_running() && crate::platform::is_installed(),
             "running core and VPN callbacks required"

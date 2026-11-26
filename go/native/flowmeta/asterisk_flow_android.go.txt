@@ -40,7 +40,7 @@ func resolveFlowOwner(metadata *C.Metadata) {
 		if err != nil {
 			return
 		}
-		uid, err := flowmeta.FindUID(metadata.NetWork.String(), source.Addr().String(), source.Port(), destination.Addr().String(), destination.Port())
+		uid, err := flowmeta.FindUID(metadata.NetWork.String(), source, destination)
 		if err != nil {
 			return
 		}

@@ -25,6 +25,9 @@ pub fn supported(spec: &ListenerSpec) -> Option<&'static str> {
             }
         }
         ListenerSpec::Shadowsocks(_) => Some("Shadowsocks inbound"),
+        ListenerSpec::WireGuard(_) => Some("WireGuard inbound"),
+        ListenerSpec::Tun(_) => Some("named TUN inbound"),
+        ListenerSpec::Anytls(_) => Some("AnyTLS inbound"),
     }
 }
 
@@ -69,6 +72,7 @@ pub async fn start(
             .with_max_connections(listener.max_connections)
             .with_tcp_keepalive(keepalive)
             .with_firewall(false)
+            .with_transparent(true)
             .with_udp(*udp, std::time::Duration::from_secs(*udp_timeout))
             .prepare(bound)
             .await

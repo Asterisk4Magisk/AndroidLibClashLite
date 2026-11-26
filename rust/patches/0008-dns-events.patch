@@ -1,108 +1,8 @@
---- a/crates/meow-config/src/dns_outbound.rs
-+++ b/crates/meow-config/src/dns_outbound.rs
-@@ -15,24 +15,45 @@
- use tokio::sync::{mpsc, watch, Mutex};
- 
- pub async fn serve_tcp<S: AsyncRead + AsyncWrite + Unpin>(
-+    stream: S,
-+    slot: ResolverSlot,
-+) -> io::Result<()> {
-+    serve_tcp_with_uid(stream, slot, None).await
-+}
-+
-+pub async fn serve_tcp_with_uid<S: AsyncRead + AsyncWrite + Unpin>(
-     mut stream: S,
-     slot: ResolverSlot,
-+    uid: Option<u32>,
- ) -> io::Result<()> {
-     loop {
--        let work = async {
-+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-+        let query = tokio::time::timeout_at(deadline, async {
-             let size = stream.read_u16().await?;
-             let mut query = vec![0; usize::from(size)];
-             stream.read_exact(&mut query).await?;
--            let resolver = slot.read().clone();
--            let response = DnsServer::handle_query(&query, &resolver)
--                .await
--                .map_err(io::Error::other)?;
-+            Ok::<_, io::Error>(query)
-+        })
-+        .await??;
-+        let resolver = slot.read().clone();
-+        let response = DnsServer::handle_query_with_deadline(
-+            &query,
-+            &resolver,
-+            meow_dns::events::QueryUid::Known(uid),
-+            deadline,
-+        )
-+        .await
-+        .map_err(|err| {
-+            err.downcast::<tokio::time::error::Elapsed>()
-+                .map_or_else(io::Error::other, |elapsed| io::Error::from(*elapsed))
-+        })?;
-+        tokio::time::timeout_at(deadline, async {
-             let size = u16::try_from(response.len()).map_err(io::Error::other)?;
-             stream.write_u16(size).await?;
-             stream.write_all(&response).await?;
-             stream.flush().await
--        };
--        tokio::time::timeout(Duration::from_secs(30), work).await??;
-+        })
-+        .await??;
-     }
- }
- 
-@@ -72,22 +93,24 @@
-     fn health(&self) -> &ProxyHealth {
-         &self.health
-     }
--    async fn dial_tcp(&self, _: &Metadata) -> Result<Box<dyn ProxyConn>> {
-+    async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
-         let slot = self.resolver()?;
-         let (client, server) = tokio::io::duplex(65536);
-+        let uid = metadata.uid;
-         let task = tokio::spawn(async move {
--            let _ = serve_tcp(server, slot).await;
-+            let _ = serve_tcp_with_uid(server, slot, uid).await;
-         });
-         Ok(Box::new(DnsStream {
-             stream: client,
-             task,
-         }))
-     }
--    async fn dial_udp(&self, _: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
-+    async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
-         let (tx, rx) = mpsc::channel(64);
-         let (closed, _) = watch::channel(false);
-         Ok(Box::new(DnsPacket {
-             slot: self.resolver()?,
-+            uid: metadata.uid,
-             tx,
-             rx: Mutex::new(rx),
-             closed,
-@@ -130,6 +153,7 @@
- }
- struct DnsPacket {
-     slot: ResolverSlot,
-+    uid: Option<u32>,
-     tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
-     rx: Mutex<mpsc::Receiver<(Vec<u8>, SocketAddr)>>,
-     closed: watch::Sender<bool>,
-@@ -156,8 +180,8 @@
-         tokio::select! {
-             _ = closed.wait_for(|v| *v) => Err(io::Error::from(io::ErrorKind::BrokenPipe).into()),
-             result = async {
--                let response = tokio::time::timeout(Duration::from_secs(5), DnsServer::handle_query(buf, &resolver))
--                    .await.map_err(io::Error::other)?.map_err(io::Error::other)?;
-+                let response = DnsServer::handle_query_with_timeout(buf, &resolver, self.uid, Duration::from_secs(5))
-+                    .await.map_err(io::Error::other)?;
-                 self.tx.send((response, *addr)).await.map_err(io::Error::other)?;
-                 Ok(buf.len())
-             } => result,
+diff --git a/crates/meow-dns/src/client.rs b/crates/meow-dns/src/client.rs
+index c4d0969..7a3c5fe 100644
 --- a/crates/meow-dns/src/client.rs
 +++ b/crates/meow-dns/src/client.rs
-@@ -550,6 +550,16 @@
+@@ -691,6 +691,16 @@ pub(crate) struct FamilySet {
      pub(crate) v4: Option<FamilyAnswer>,
      pub(crate) v6: Option<FamilyAnswer>,
      pub(crate) source: String,
@@ -117,11 +17,11 @@
 +        self
 +    }
  }
- 
+
  enum Transport {
-@@ -835,8 +845,76 @@
+@@ -1193,8 +1203,76 @@ impl DnsClient {
      }
- 
+
      /// Human-readable upstream identifier for API/UI surfaces.
 +    pub(crate) fn event_origin(&self) -> crate::events::Origin {
 +        use meow_common::AdapterType;
@@ -197,9 +97,9 @@
              label.to_string()
          } else {
              match &self.transport {
-@@ -883,15 +961,7 @@
-                     }
-                 }
+@@ -1244,15 +1322,7 @@ impl DnsClient {
+                     addr, sni, path, ..
+                 } => doh_label(addr, sni, path),
              }
 -        };
 -        if let Some(proxy) = &self.proxy {
@@ -208,13 +108,12 @@
 -            // the adapter actually dialed (r15 review I4).
 -            label.push_str(" via ");
 -            label.push_str(proxy.name());
--        }
+         }
 -        label
-+        }
      }
- 
+
      /// Send a query for `(name, record_type)` and return the parsed response
-@@ -1067,7 +1137,12 @@
+@@ -1428,7 +1498,12 @@ impl DnsClient {
          } else {
              (None, Some(answer))
          };
@@ -226,19 +125,22 @@
 +            event_client: None,
 +        })
      }
- 
+
      async fn lookup_ip_with_ipv6_inner(
-@@ -1807,6 +1882,7 @@
+@@ -2653,6 +2728,7 @@ fn family_set_from_ip_lookup(result: &IpLookupResult, source: String) -> FamilyS
          v4: result.v4.clone(),
          v6: result.v6.clone(),
          source,
 +        event_client: None,
      }
  }
- 
+
+diff --git a/crates/meow-dns/src/events.rs b/crates/meow-dns/src/events.rs
+new file mode 100644
+index 0000000..eaf5760
 --- /dev/null
 +++ b/crates/meow-dns/src/events.rs
-@@ -0,0 +1,335 @@
+@@ -0,0 +1,350 @@
 +//! Structured events for client DNS requests. The controller subscribes to a
 +//! bounded feed so publishing an event never waits for an HTTP reader.
 +use crate::client::DnsClient;
@@ -574,30 +476,38 @@
 +            .all(|c| c.is_ascii_alphanumeric() || b".:-[]".contains(&c)))
 +    .then(|| label.to_owned())
 +}
++
++tokio::task_local! {
++    static OUTBOUND_UID: u32;
++}
++
++pub async fn with_outbound_uid<F: std::future::Future>(uid: Option<u32>, work: F) -> F::Output {
++    match uid {
++        Some(uid) => OUTBOUND_UID.scope(uid, work).await,
++        None => work.await,
++    }
++}
++
++pub(crate) fn outbound_uid() -> Option<u32> {
++    OUTBOUND_UID.try_with(|uid| *uid).ok()
++}
+diff --git a/crates/meow-dns/src/lib.rs b/crates/meow-dns/src/lib.rs
+index d78e554..ec97fa3 100644
 --- a/crates/meow-dns/src/lib.rs
 +++ b/crates/meow-dns/src/lib.rs
-@@ -5,6 +5,7 @@
- 
+@@ -6,6 +6,7 @@
+ pub mod answer_hook;
  pub mod cache;
  pub mod client;
 +pub mod events;
  pub mod fakeip;
  pub mod host_resolver_hook;
  pub mod resolver;
+diff --git a/crates/meow-dns/src/resolver.rs b/crates/meow-dns/src/resolver.rs
+index 137a17b..1c69084 100644
 --- a/crates/meow-dns/src/resolver.rs
 +++ b/crates/meow-dns/src/resolver.rs
-@@ -41,7 +41,9 @@
- #[derive(Debug, thiserror::Error)]
- #[non_exhaustive]
- pub enum BootstrapError {
--    #[error("default-nameserver entry '{entry}' must be a plain UDP/TCP nameserver (tls:// and https:// are not allowed here because they would create a bootstrap loop)")]
-+    #[error(
-+        "default-nameserver entry '{entry}' must be a plain UDP/TCP nameserver (tls:// and https:// are not allowed here because they would create a bootstrap loop)"
-+    )]
-     DefaultNameserverNotPlain { entry: String },
-     #[error("cannot resolve '{host}' via bootstrap nameserver: {source}")]
-     CannotResolve { host: String, source: BoxError },
-@@ -615,7 +617,7 @@
+@@ -654,7 +654,7 @@ async fn query_pool_set(
                  started.elapsed().as_millis()
              );
              // A positive answer always wins, regardless of grace state.
@@ -606,7 +516,7 @@
          }
          conn_note!(
              Dns,
-@@ -632,7 +634,7 @@
+@@ -671,7 +671,7 @@ async fn query_pool_set(
              // failure used to leave the timer unset, and a later
              // definitive negative could then never enter this branch —
              // the tier would wait out every upstream's full timeout).
@@ -615,7 +525,7 @@
              negative_deadline = Some(tokio::time::Instant::now() + NEGATIVE_GRACE_PERIOD);
          } else if definitive
              && !negative
-@@ -642,7 +644,7 @@
+@@ -681,7 +681,7 @@ async fn query_pool_set(
              // A definitive negative strictly improves on a partial failure
              // kept as the last-resort answer. First-wins still applies
              // between two answers of equal quality.
@@ -624,7 +534,7 @@
          }
      }
      (negative, upstream_err)
-@@ -744,12 +746,24 @@
+@@ -803,12 +803,24 @@ async fn query_pool_generic(
      name: &Name,
      record_type: RecordType,
  ) -> Option<Message> {
@@ -653,7 +563,7 @@
              tokio::pin!(f1);
              tokio::pin!(f2);
              tokio::select! {
-@@ -760,13 +774,16 @@
+@@ -819,13 +831,16 @@ async fn query_pool_generic(
          _ => {
              let futs: Vec<_> = clients
                  .iter()
@@ -663,20 +573,19 @@
 +                .map(|client| Box::pin(attempt(client, name, record_type)))
                  .collect();
 -            futures::future::select_ok(futs).await.ok().map(|(m, _)| m)
--        }
--    }
 +            futures::future::select_ok(futs)
 +                .await
 +                .ok()
 +                .map(|(answer, _)| answer)
-+        }
+         }
+-    }
 +    }?;
 +    crate::events::set_client(client);
 +    Some(message)
  }
- 
+
  impl Resolver {
-@@ -1504,6 +1521,7 @@
+@@ -1604,6 +1619,7 @@ impl Resolver {
          if self.mode == DnsMode::FakeIp {
              if let Some(pool) = &self.fakeip_v4 {
                  if !self.skipper_bypasses(host) {
@@ -684,7 +593,7 @@
                      return LocalLookup::Decided(AddressLookupResult::Answer(
                          pool.lookup(host),
                          self.fakeip_ttl,
-@@ -1512,6 +1530,7 @@
+@@ -1612,6 +1628,7 @@ impl Resolver {
              }
          }
          if let Some(hit) = self.fresh_family_hit(host, QueryFamilies::IPV4) {
@@ -692,7 +601,7 @@
              return LocalLookup::Decided(hit);
          }
          LocalLookup::Upstream(host)
-@@ -1571,6 +1590,7 @@
+@@ -1671,6 +1688,7 @@ impl Resolver {
          if self.mode == DnsMode::FakeIp {
              if let Some(pool) = &self.fakeip_v6 {
                  if !self.skipper_bypasses(host) {
@@ -700,7 +609,7 @@
                      return LocalLookup::Decided(AddressLookupResult::Answer(
                          pool.lookup(host),
                          self.fakeip_ttl,
-@@ -1578,10 +1598,12 @@
+@@ -1678,10 +1696,12 @@ impl Resolver {
                  }
              } else if self.fakeip_v4.is_some() && !self.skipper_bypasses(host) {
                  // v4-only fake-ip config: suppress AAAA so clients fall back.
@@ -713,7 +622,7 @@
              return LocalLookup::Decided(hit);
          }
          LocalLookup::Upstream(host)
-@@ -1634,6 +1656,9 @@
+@@ -1734,6 +1754,9 @@ impl Resolver {
              } else {
                  &cached.v6
              };
@@ -723,7 +632,7 @@
              match hit {
                  FamilyCacheHit::Answer(ips, ttl) => {
                      return AddressLookupResult::Answer(ips[0], *ttl);
-@@ -1661,6 +1686,9 @@
+@@ -1761,6 +1784,9 @@ impl Resolver {
                  } else {
                      &cached.v6
                  };
@@ -733,7 +642,7 @@
                  return match hit {
                      FamilyCacheHit::Answer(ips, ttl) => AddressLookupResult::Answer(ips[0], *ttl),
                      FamilyCacheHit::NoData => AddressLookupResult::NoData,
-@@ -1670,6 +1698,9 @@
+@@ -1770,6 +1796,9 @@ impl Resolver {
              }
              return AddressLookupResult::Failed;
          };
@@ -743,16 +652,16 @@
          let answer = if family == QueryFamilies::IPV4 {
              &set.v4
          } else {
+diff --git a/crates/meow-dns/src/server.rs b/crates/meow-dns/src/server.rs
+index f4cd9b8..6c8c28e 100644
 --- a/crates/meow-dns/src/server.rs
 +++ b/crates/meow-dns/src/server.rs
-@@ -112,6 +112,67 @@
-     }
- 
-     pub async fn handle_query(
-+        data: &[u8],
-+        resolver: &Resolver,
+@@ -233,6 +233,73 @@ impl DnsServer {
+         data: &[u8],
+         resolver: &Resolver,
+         charge: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
 +    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-+        Self::observe_query(data, resolver, crate::events::QueryUid::Known(None), None).await
++        Self::observe_query(data, resolver, crate::events::QueryUid::Known(None), None, charge).await
 +    }
 +
 +    pub async fn handle_query_with_timeout(
@@ -776,7 +685,7 @@
 +        uid: crate::events::QueryUid,
 +        deadline: tokio::time::Instant,
 +    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-+        Self::observe_query(data, resolver, uid, Some(deadline)).await
++        Self::observe_query(data, resolver, uid, Some(deadline), None).await
 +    }
 +
 +    async fn observe_query(
@@ -784,9 +693,10 @@
 +        resolver: &Resolver,
 +        uid: crate::events::QueryUid,
 +        deadline: Option<tokio::time::Instant>,
++        charge: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
 +    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
 +        let handle = || async {
-+            let query = Self::handle_query_inner(data, resolver);
++            let query = Self::handle_query_inner(data, resolver, charge);
 +            match deadline {
 +                Some(deadline) => tokio::time::timeout_at(deadline, query).await?,
 +                None => query.await,
@@ -795,6 +705,10 @@
 +        if !crate::events::enabled() {
 +            return handle().await;
 +        }
++        let uid = match uid {
++            crate::events::QueryUid::Known(None) => crate::events::QueryUid::Known(crate::events::outbound_uid()),
++            uid => uid,
++        };
 +        let start = std::time::Instant::now();
 +        crate::events::ORIGIN
 +            .scope(Default::default(), async {
@@ -810,10 +724,13 @@
 +    }
 +
 +    async fn handle_query_inner(
-         data: &[u8],
-         resolver: &Resolver,
++        data: &[u8],
++        resolver: &Resolver,
++        charge: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
      ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-@@ -196,6 +257,7 @@
+         // Minimal DNS parsing: extract the query name and type
+         if data.len() < 12 {
+@@ -336,6 +403,7 @@ impl DnsServer {
          // rather than NXDOMAIN — clients may retry on NXDOMAIN but not on an
          // empty-answer NOERROR response.
          if let Some(all_ips) = resolver.lookup_hosts_all(&domain) {
@@ -821,15 +738,15 @@
              // When IPv6 is disabled, an AAAA query for a hosts entry that
              // *does* have a v6 address still returns that address — the
              // hosts file is an explicit user override that takes priority
-@@ -226,6 +288,7 @@
+@@ -380,6 +448,7 @@ impl DnsServer {
          // filtered anyway. This comes *after* the hosts check so a hosts
          // override for the disabled family is still honored.
          if qtype == 28 && !resolver.ipv6_enabled() {
 +            crate::events::source("local");
              return Ok(Self::build_noerror_empty(id, data, flags, question_len));
          }
- 
-@@ -274,6 +337,26 @@
+
+@@ -431,6 +500,26 @@ impl DnsServer {
      /// `pub` for the TUN dns-hijack path (`meow-listener`), which answers
      /// locally-decidable queries inline instead of spending a task spawn.
      pub fn try_answer_local(data: &[u8], resolver: &Resolver) -> LocalAnswer {
@@ -844,7 +761,7 @@
 +                    start,
 +                    data,
 +                    Some(response),
-+                    crate::events::QueryUid::Known(None),
++                    crate::events::QueryUid::Known(crate::events::outbound_uid()),
 +                    false,
 +                );
 +            }
@@ -856,19 +773,55 @@
          if data.len() < 12 {
              return LocalAnswer::Drop; // handle_query errs — silently dropped
          }
-@@ -329,6 +412,7 @@
+@@ -523,6 +612,7 @@ impl DnsServer {
                  } else {
                      all_ips.iter().find(|ip| ip.is_ipv6()).copied()
                  };
 +                crate::events::source("hosts");
                  LocalAnswer::Answer(match ip {
-                     Some(addr) => Self::build_response(
-                         id,
-@@ -342,6 +426,7 @@
-                     None => Self::build_noerror_empty(id, data, flags, question_len),
+                     // The hook's `(domain, addr, ttl)` is captured for the
+                     // caller to run off the loop — the response bytes are
+@@ -552,6 +642,7 @@ impl DnsServer {
+                     )),
                  })
              } else if qtype == 28 && !resolver.ipv6_enabled() {
 +                crate::events::source("local");
-                 LocalAnswer::Answer(Self::build_noerror_empty(id, data, flags, question_len))
-             } else {
-                 // lookup_*_local covers the remaining local decisions:
+                 LocalAnswer::Answer(LocalResponse::plain(Self::build_noerror_empty(
+                     id,
+                     data,
+diff --git a/crates/meow-proxy/src/dns_adapter.rs b/crates/meow-proxy/src/dns_adapter.rs
+index 1de9e84..5d71b92 100644
+--- a/crates/meow-proxy/src/dns_adapter.rs
++++ b/crates/meow-proxy/src/dns_adapter.rs
+@@ -117,12 +117,15 @@ impl ProxyAdapter for DnsAdapter {
+         let cell = Arc::clone(&self.cell);
+         let budget = Arc::clone(&self.budget);
+         let name = self.name.clone();
++        let uid = metadata.uid;
+         // The serve task is owned by the conn: dropping the client half
+         // aborts it even while it parks on an upstream-budget permit —
+         // otherwise a dead conn could still spend a freed permit on an
+         // upstream query nobody reads (issue #974 review).
+         let serve = tokio::spawn(async move {
+-            if let Err(error) = serve_dns_outbound_stream(server, cell, budget).await {
++            if let Err(error) =
++                meow_dns::events::with_outbound_uid(uid, serve_dns_outbound_stream(server, cell, budget)).await
++            {
+                 debug!("dns outbound '{name}' tcp serve ended: {error}");
+             }
+         });
+@@ -136,12 +139,12 @@ impl ProxyAdapter for DnsAdapter {
+         self.reject_inner(metadata)?;
+         let (query_tx, query_rx) = mpsc::channel(UDP_QUEUE);
+         let (reply_tx, reply_rx) = mpsc::channel(UDP_QUEUE);
+-        let driver = tokio::spawn(run_outbound_datagrams(
++        let driver = tokio::spawn(meow_dns::events::with_outbound_uid(metadata.uid, run_outbound_datagrams(
+             query_rx,
+             reply_tx,
+             Arc::clone(&self.cell),
+             Arc::clone(&self.budget),
+-        ));
++        )));
+         Ok(Box::new(DnsPacketConn {
+             queries: query_tx,
+             replies: Mutex::new(reply_rx),

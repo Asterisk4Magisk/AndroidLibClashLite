@@ -20,25 +20,20 @@ var errAmbiguousOwner = errors.New("ambiguous socket owner")
 
 // FindUID selects procfs only on Android before API 29. Newer systems use
 // socket diagnostics and return its errors without retrying through procfs.
-func FindUID(network, source string, sourcePort uint16, destination string, destinationPort uint16) (int, error) {
+func FindUID(network string, source, destination netip.AddrPort) (int, error) {
 	if network != "tcp" && network != "udp" {
 		return -1, errors.New("invalid network")
 	}
-	src, e := netip.ParseAddr(source)
-	if e != nil {
-		return -1, e
-	}
-	dst, e := netip.ParseAddr(destination)
-	if e != nil {
-		return -1, e
+	if !source.IsValid() || !destination.IsValid() {
+		return -1, errors.New("invalid socket address")
 	}
 	// A wildcard UDP socket can only own traffic originating on this device.
 	// Forwarded hotspot clients may use the same port as a local application.
-	if !localSource(src) {
+	if !localSource(source.Addr()) {
 		return -1, errors.New("source is not local")
 	}
-	sourceAddr := netip.AddrPortFrom(src.Unmap(), sourcePort)
-	destinationAddr := netip.AddrPortFrom(dst.Unmap(), destinationPort)
+	sourceAddr := netip.AddrPortFrom(source.Addr().Unmap(), source.Port())
+	destinationAddr := netip.AddrPortFrom(destination.Addr().Unmap(), destination.Port())
 	if androidAPILevel > 0 && androidAPILevel < 29 {
 		return findUIDInTables(network, sourceAddr, destinationAddr, func(path string) (io.ReadCloser, error) {
 			return os.Open(path)

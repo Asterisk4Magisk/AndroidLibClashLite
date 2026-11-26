@@ -1,79 +1,11 @@
---- a/crates/meow-proxy/src/group/selector.rs
-+++ b/crates/meow-proxy/src/group/selector.rs
-@@ -12,7 +12,9 @@
-     name: SmolStr,
-     static_proxies: Vec<Arc<dyn Proxy>>,
-     provider_slots: Vec<ProviderSlot>,
--    /// Name of the currently selected proxy; `None` means use the first.
-+    /// Optional fallback independent of member display order.
-+    default_proxy: Option<Arc<dyn Proxy>>,
-+    /// Name of the currently selected proxy; `None` means use the default.
-     /// (Upstream prefers a `COMPATIBLE` member as the initial default;
-     /// we keep the simpler first-member default — COMPATIBLE dials like
-     /// DIRECT either way, so the divergence is cosmetic.)
-@@ -29,6 +31,7 @@
-             name: SmolStr::from(name),
-             static_proxies: proxies,
-             provider_slots: Vec::new(),
-+            default_proxy: None,
-             selected: RwLock::new(None),
-             store: None,
-             health: ProxyHealth::new(),
-@@ -45,11 +48,25 @@
-             name: SmolStr::from(name),
-             static_proxies: proxies,
-             provider_slots: slots,
-+            default_proxy: None,
-             selected: RwLock::new(None),
-             store: None,
-             health: ProxyHealth::new(),
-             display: GroupDisplay::default(),
-         }
-+    }
-+
-+    /// Use a static member as the fallback without moving it in the list.
-+    /// Saved or manual choices still take precedence, while a removed choice
-+    /// falls back to this member rather than the first displayed member.
-+    #[must_use]
-+    pub fn with_default(mut self, name: &str) -> Self {
-+        self.default_proxy = self
-+            .static_proxies
-+            .iter()
-+            .find(|p| p.name() == name)
-+            .cloned();
-+        self
-     }
- 
-     /// Attach a persistent store. The previously-saved choice (if any) is
-@@ -101,10 +118,10 @@
- 
-     /// Resolve `selected` to an `Arc<dyn Proxy>` without allocating a unified
-     /// `Vec`. Walks `static_proxies` then provider slots; falls back to the
--    /// first proxy if `selected` is unset or names something no longer present.
-+    /// configured default (or first proxy) if the choice is unset or removed.
-     pub fn selected_proxy(&self) -> Option<Arc<dyn Proxy>> {
-         let sel: Option<SmolStr> = self.selected.read().clone();
--        let mut first_any: Option<Arc<dyn Proxy>> = None;
-+        let mut first_any = self.default_proxy.clone();
-         if let Some(name) = sel {
-             for p in &self.static_proxies {
-                 if first_any.is_none() {
-@@ -126,6 +143,9 @@
-                 }
-             }
-             return first_any;
-+        }
-+        if let Some(p) = &self.default_proxy {
-+            return Some(Arc::clone(p));
-         }
-         if let Some(p) = self.static_proxies.first() {
-             return Some(Arc::clone(p));
+diff --git a/crates/meow-config/src/lib.rs b/crates/meow-config/src/lib.rs
+index b17bab8..5e0e3f2 100644
 --- a/crates/meow-config/src/lib.rs
 +++ b/crates/meow-config/src/lib.rs
-@@ -2655,62 +2655,48 @@
+@@ -3771,72 +3771,48 @@ fn build_proxy_layer(
          ));
      }
- 
+
 -    // Auto-create GLOBAL selector if not defined by user (mihomo compatibility).
 -    // clash-nyanpasu and other frontends depend on GLOBAL to build proxy tree.
 -    // Keep the complete sorted list they expect, but put the config's primary
@@ -121,12 +53,26 @@
              .collect();
 -        all_proxy_names.sort();
 -        let primary = primary_global_target(raw, &proxies).map(str::to_string);
--        if let Some(primary) = primary.as_deref() {
--            if let Some(position) = all_proxy_names.iter().position(|name| name == primary) {
--                all_proxy_names.remove(position);
--                all_proxy_names.insert(0, primary.to_string());
--            }
--        }
+-        // The member at index 0 is the selector's default pick: the
+-        // primary when it resolves, else the first non-control member —
+-        // a sorted-first rematch or dns leaf answers no ordinary flow
+-        // and can never be a dialable default (issue #974 review).
+-        let default_position = match primary.as_deref() {
+-            Some(primary) => all_proxy_names.iter().position(|name| name == primary),
+-            None => all_proxy_names.iter().position(|name| {
+-                proxies.get(name.as_str()).is_some_and(|p| {
+-                    !matches!(p.adapter_type(), AdapterType::Rematch | AdapterType::Dns)
+-                })
+-            }),
+-        };
+-        if let Some(position) = default_position {
+-            let name = all_proxy_names.remove(position);
+-            all_proxy_names.insert(0, name);
++        let primary = primary_global_target(raw, &proxies);
++        let mut global = meow_proxy::SelectorGroup::new("GLOBAL", all_proxies);
++        if let Some(primary) = primary {
++            global = global.with_default(primary);
+         }
 -        let global_config = raw::RawProxyGroup {
 -            name: "GLOBAL".to_string(),
 -            group_type: "select".to_string(),
@@ -138,7 +84,7 @@
 -            &proxies,
 -            &[],
 -            providers,
--            selector_store,
+-            selection,
 -        ) {
 -            Ok(group) => {
 -                proxies.insert(SmolStr::new_static("GLOBAL"), group);
@@ -148,15 +94,9 @@
 -                );
 -            }
 -            Err(e) => warn!("Failed to create GLOBAL selector: {}", e),
--        }
-+        let primary = primary_global_target(raw, &proxies);
-+        let mut global = meow_proxy::SelectorGroup::new("GLOBAL", all_proxies);
-+        if let Some(primary) = primary {
-+            global = global.with_default(primary);
-+        }
-+        if let Some(store) = selector_store {
-+            global = global.with_store(Arc::clone(store));
-+        }
++        if let Some(store) = selection {
++            global = global.with_store(store.clone());
+         }
 +        proxies.insert(SmolStr::new_static("GLOBAL"), Arc::new(global));
 +        info!(
 +            primary = primary.unwrap_or("DIRECT"),
@@ -165,10 +105,12 @@
      }
      // Whether `GLOBAL` is the auto-created all-registry selector or a declared
      // group changes what a `dialer-proxy: GLOBAL` edge can reach.
+diff --git a/crates/meow-config/tests/config_persistence_test.rs b/crates/meow-config/tests/config_persistence_test.rs
+index 67c1a38..33b9c2a 100644
 --- a/crates/meow-config/tests/config_persistence_test.rs
 +++ b/crates/meow-config/tests/config_persistence_test.rs
-@@ -240,12 +240,17 @@
- 
+@@ -349,12 +349,17 @@ rules:
+
      assert_eq!(global.current().as_deref(), Some("Proxies"));
      let members = global.members().expect("GLOBAL selector members");
 -    assert_eq!(members.first().map(String::as_str), Some("Proxies"));
@@ -189,5 +131,79 @@
 +        ]
 +    );
  }
- 
+
  /// Issue #533: the match-loop signal adapters register as real built-ins,
+diff --git a/crates/meow-proxy/src/group/selector.rs b/crates/meow-proxy/src/group/selector.rs
+index 327d879..30168bb 100644
+--- a/crates/meow-proxy/src/group/selector.rs
++++ b/crates/meow-proxy/src/group/selector.rs
+@@ -12,7 +12,9 @@ pub struct SelectorGroup {
+     name: SmolStr,
+     static_proxies: Vec<Arc<dyn Proxy>>,
+     provider_slots: Vec<ProviderSlot>,
+-    /// Name of the currently selected proxy; `None` means use the first.
++    /// Optional fallback independent of member display order.
++    default_proxy: Option<Arc<dyn Proxy>>,
++    /// Name of the currently selected proxy; `None` means use the default.
+     /// (Upstream prefers a `COMPATIBLE` member as the initial default;
+     /// we keep the simpler first-member default — COMPATIBLE dials like
+     /// DIRECT either way, so the divergence is cosmetic.)
+@@ -29,6 +31,7 @@ impl SelectorGroup {
+             name: SmolStr::from(name),
+             static_proxies: proxies,
+             provider_slots: Vec::new(),
++            default_proxy: None,
+             selected: RwLock::new(None),
+             store: None,
+             health: ProxyHealth::new(),
+@@ -45,6 +48,7 @@ impl SelectorGroup {
+             name: SmolStr::from(name),
+             static_proxies: proxies,
+             provider_slots: slots,
++            default_proxy: None,
+             selected: RwLock::new(None),
+             store: None,
+             health: ProxyHealth::new(),
+@@ -52,6 +56,19 @@ impl SelectorGroup {
+         }
+     }
+
++    /// Use a static member as the fallback without moving it in the list.
++    /// Saved or manual choices still take precedence, while a removed choice
++    /// falls back to this member rather than the first displayed member.
++    #[must_use]
++    pub fn with_default(mut self, name: &str) -> Self {
++        self.default_proxy = self
++            .static_proxies
++            .iter()
++            .find(|p| p.name() == name)
++            .cloned();
++        self
++    }
++
+     /// Attach the epoch-fenced persistence writer. The saved choice is
+     /// not copied out here: `selected_proxy` asks the store lazily, so
+     /// the group serves the exact map the backing's `commit` adopts —
+@@ -114,10 +131,10 @@ impl SelectorGroup {
+
+     /// Resolve `selected` to an `Arc<dyn Proxy>` without allocating a unified
+     /// `Vec`. Walks `static_proxies` then provider slots; falls back to the
+-    /// first proxy if `selected` is unset or names something no longer present.
++    /// configured default (or first proxy) if the choice is unset or removed.
+     pub fn selected_proxy(&self) -> Option<Arc<dyn Proxy>> {
+         let sel: Option<SmolStr> = self.effective_selection();
+-        let mut first_any: Option<Arc<dyn Proxy>> = None;
++        let mut first_any = self.default_proxy.clone();
+         if let Some(name) = sel {
+             for p in &self.static_proxies {
+                 if first_any.is_none() {
+@@ -140,6 +157,9 @@ impl SelectorGroup {
+             }
+             return first_any;
+         }
++        if let Some(p) = &self.default_proxy {
++            return Some(Arc::clone(p));
++        }
+         if let Some(p) = self.static_proxies.first() {
+             return Some(Arc::clone(p));
+         }

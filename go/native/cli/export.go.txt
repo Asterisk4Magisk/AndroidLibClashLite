@@ -15,6 +15,7 @@ import (
 	_ "cfa/environment"
 	_ "cfa/native/autoswitch/api"
 	_ "cfa/native/capabilities/api"
+	"cfa/native/dnsevents"
 	_ "cfa/native/dnsevents/api"
 	_ "cfa/native/proxyip/api"
 	"cfa/native/systemdns"
@@ -40,11 +41,15 @@ func AndroidMihomoCLI_v1(argc C.int, argv **C.char, stdoutFD, stderrFD C.int) C.
 }
 
 // Called by the CLI overlay after tool commands and home-directory selection.
-func startSystemDNS(home string) func() {
+func startRuntimeServices(home string) func() {
 	stop, err := systemdns.Start(home)
 	if err != nil {
 		_, _ = os.Stderr.WriteString(err.Error() + "\n")
 		os.Exit(70)
 	}
-	return stop
+	dnsevents.StartCollection()
+	return func() {
+		dnsevents.StopCollection()
+		stop()
+	}
 }

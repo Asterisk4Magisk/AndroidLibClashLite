@@ -27,8 +27,8 @@ def prepare_sources(repo, work, core):
     main = replace_once(main, 'func main() {', 'func mihomoCLIMain() {')
     main = replace_once(main, '\tif geodataMode {',
                         '\tif !testConfig {\n'
-                        '\t\tstopSystemDNS := startSystemDNS(C.Path.HomeDir())\n'
-                        '\t\tdefer stopSystemDNS()\n'
+                        '\t\tstopRuntimeServices := startRuntimeServices(C.Path.HomeDir())\n'
+                        '\t\tdefer stopRuntimeServices()\n'
                         '\t}\n\n\tif geodataMode {')
     cli = work / 'cli'
     cli.mkdir(exist_ok=True)
@@ -534,7 +534,7 @@ def patch_dns_events(patch):
           'result.Msg, result.Origin, err = r.ipExchange(ctx, m)\n\t\t\treturn')
     for clients in ('matched', 'r.main'):
         patch(resolver, f'result, cache, err = batchExchange(ctx, {clients}, m)',
-              f'result.Msg, result.Origin, cache, err = batchExchange(ctx, {clients}, m)')
+              f'result.Msg, result.Origin, cache, err = batchExchange(ctx, {clients}, m, true)')
     patch(resolver, 'singleflight.Result[*D.Msg]', 'singleflight.Result[dnsResult]')
     patch(resolver, 'if err != nil && !shared && ret.Opcode < retryMax { // retry\n'
                     '\t\t\t\t\tr.group.DoChan(q.String(), fn)',
@@ -557,17 +557,22 @@ def patch_dns_events(patch):
         patch(resolver, 'msg, err = res.Msg, res.Error' + suffix,
               'msg, origin, err = res.Msg, res.Origin, res.Error' + suffix)
     patch(resolver, 'res, _, err := batchExchange(ctx, client, msg)\n\t\tch <- &result{Msg: res, Error: err}',
-          'res, origin, _, err := batchExchange(ctx, client, msg)\n'
+          'res, origin, _, err := batchExchange(ctx, client, msg, true)\n'
           '\t\tch <- &result{Msg: res, Origin: origin, Error: err}')
-    for path in ('dns/dhcp.go', 'dns/system.go'):
-        patch(path, 'msg, _, err = batchExchange', 'msg, _, _, err = batchExchange')
+    # The outer attempt already describes these system transports. Their
+    # nested exchanges discard origin and cannot publish independent events.
+    for path, clients in (('dns/dhcp.go', 'clients'), ('dns/system.go', 'dnsClients')):
+        patch(path, f'msg, _, err = batchExchange(ctx, {clients}, m)',
+              f'msg, _, _, err = batchExchange(ctx, {clients}, m, false)')
 
+    patch(util, 'func batchExchange(ctx context.Context, clients []dnsClient, m *D.Msg)',
+          'func batchExchange(ctx context.Context, clients []dnsClient, m *D.Msg, observe bool)')
     patch(util, '(msg *D.Msg, cache bool, err error) {\n\tcache = true',
           '(msg *D.Msg, origin *dnsevents.Origin, cache bool, err error) {\n\tcache = true')
     patch(util, 'picker.WithTimeout[*D.Msg](ctx, resolver.DefaultDNSTimeout)',
           'picker.WithTimeout[dnsResult](ctx, resolver.DefaultDNSTimeout)')
     patch(util, 'return msg, false, err',
-          'if dnsevents.Enabled() { origin = &dnsevents.Origin{Source: "local"} }\n\t\treturn msg, origin, false, err')
+          'if observe && dnsevents.Enabled() { origin = &dnsevents.Origin{Source: "local"} }\n\t\treturn msg, origin, false, err')
     patch(util, 'fast.Go(func() (*D.Msg, error) {',
           'fast.Go(func() (dnsResult, error) {')
     patch(util, 'import (', 'import (\n\t"sync/atomic"')
@@ -602,7 +607,7 @@ func batchExchange(''')
     patch(util, '\t\t\tm, err := client.ExchangeContext(ctx, m)',
           '\t\t\tctx := ctx\n\t\t\tvar origin *dnsevents.Origin\n'
           '\t\t\tvar egress *atomic.Pointer[dnsevents.Egress]\n'
-          '\t\t\tif dnsevents.Enabled() {\n'
+          '\t\t\tif observe && dnsevents.Enabled() {\n'
           '\t\t\t\tvar fresh bool\n\t\t\t\torigin, fresh = describeDNSAttempt(client, m)\n'
           '\t\t\t\tif fresh { ctx, egress = dnsevents.TrackEgress(ctx) }\n\t\t\t}\n'
           '\t\t\tm, err := client.ExchangeContext(ctx, m)')
@@ -673,8 +678,8 @@ func recordDNSEgress(ctx context.Context, adapter C.ProxyAdapter, connection C.C
     tun = 'listener/sing_tun/dns.go'
     patch(tun, 'import (', 'import (\n\t"cfa/native/dnsevents/owner"')
     patch(tun, 'return resolver.RelayDnsConn(ctx, conn, resolver.DefaultDnsReadTimeout)',
-          'return resolver.RelayDnsConnWithOwner(ctx, conn, resolver.DefaultDnsReadTimeout, func(ctx context.Context) context.Context {\n'
-          '\t\t\treturn owner.ForFlow(ctx, "tcp", metadata.Source.AddrPort(), metadata.Destination.AddrPort())\n\t\t})')
+          'return resolver.RelayDnsConnWithOwner(ctx, conn, resolver.DefaultDnsReadTimeout,\n'
+          '\t\t\towner.PrepareTCPUID(metadata.Source.AddrPort(), metadata.Destination.AddrPort()))')
     patch(tun, 'go relayDnsPacket(ctx, buffer, rwOptions, metadata.Destination, nil, &writer)',
           'go relayDnsPacket(ctx, buffer, rwOptions, metadata.Source, metadata.Destination, nil, &writer)')
     patch(tun, 'go relayDnsPacket(ctx, readBuff, rwOptions, dest, &mutex, &writer)',
@@ -683,7 +688,7 @@ func recordDNSEgress(ctx context.Context, adapter C.ProxyAdapter, connection C.C
           'rwOptions network.ReadWaitOptions, source, dest M.Socksaddr, mutex *sync.Mutex')
     patch(tun, 'resolver.RelayDnsPacket(ctx, inData, writeBuff.FreeBytes())',
           'resolver.RelayDnsPacketWithOwner(ctx, inData, writeBuff.FreeBytes(), func(ctx context.Context) context.Context {\n'
-          '\t\treturn owner.ForFlow(ctx, "udp", source.AddrPort(), dest.AddrPort())\n\t})')
+          '\t\treturn owner.ForUDP(ctx, source.AddrPort(), dest.AddrPort())\n\t})')
 
     outbound = 'adapter/outbound/dns.go'
     patch(outbound, 'import (', 'import (\n\t"cfa/native/dnsevents/owner"')
