@@ -18,7 +18,7 @@ use tokio::{
 };
 
 pub fn tokens(bytes: &[u8]) -> Result<HashMap<String, String>> {
-    let (value, _) = crate::profile::decode_core(bytes)?;
+    let value = crate::profile::decode(bytes)?;
     let mut result = HashMap::new();
     if let Some(entries) = value.get("listeners").and_then(|v| v.as_sequence()) {
         for entry in entries {

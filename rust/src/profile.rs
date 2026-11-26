@@ -41,7 +41,7 @@ pub fn decode(bytes: &[u8]) -> Result<Value> {
     Ok(value)
 }
 
-/// The Unix controller belongs to the Android binding, not meow's raw config.
+/// Decode the profile for Meow, excluding fields owned by the Android binding.
 pub fn decode_core(bytes: &[u8]) -> Result<(Value, Option<String>)> {
     let mut value = decode(bytes)?;
     let socket = value
@@ -54,6 +54,16 @@ pub fn decode_core(bytes: &[u8]) -> Result<(Value, Option<String>)> {
         Some(Value::String(path)) => Some(path),
         _ => anyhow::bail!("external-controller-unix must be a path string"),
     };
+    if let Some(listeners) = value.get_mut("listeners").and_then(Value::as_sequence_mut) {
+        for listener in listeners.iter_mut().filter_map(Value::as_mapping_mut) {
+            if listener.get("name").and_then(Value::as_str) == Some("asterisk-bridge")
+                && listener.get("type").and_then(Value::as_str) == Some("socks5")
+            {
+                // The bridge reads its own token before binding; Meow's users field is for AnyTLS.
+                listener.remove("users");
+            }
+        }
+    }
     Ok((value, socket))
 }
 
