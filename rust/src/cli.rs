@@ -65,10 +65,6 @@ fn run(args: Vec<String>) -> Result<i32> {
     })?;
     #[cfg(target_os = "android")]
     let mut system_dns = crate::systemdns::root::Watcher::start(std::path::Path::new(&home))?;
-    #[cfg(target_os = "android")]
-    {
-        crate::dns_uid::install();
-    }
     let result = crate::engine::start(
         &home,
         &home,

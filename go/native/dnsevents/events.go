@@ -6,7 +6,6 @@ package dnsevents
 import (
 	"context"
 	"errors"
-	"net/netip"
 	"net/url"
 	"strings"
 	"sync"
@@ -58,8 +57,10 @@ func (e Event) format() Event {
 	if e.UID == nil && e.lookupUID != nil {
 		if uid, ok := e.lookupUID(); ok {
 			e.UID = &uid
-			e.UIDSource = "socket"
 		}
+	}
+	if e.UID != nil {
+		e.UIDSource = "socket"
 	}
 	e.wireAnswers = nil
 	e.origin = Origin{}
@@ -81,30 +82,7 @@ type Egress struct {
 type requestKey struct{}
 type uidKey struct{}
 
-type observedUID struct {
-	uid    uint32
-	source string
-}
 type uidLookupKey struct{}
-type ingressKey struct{}
-
-type ingress struct {
-	network             string
-	source, destination netip.AddrPort
-}
-
-func WithIngress(ctx context.Context, network string, source, destination netip.AddrPort) context.Context {
-	return context.WithValue(ctx, ingressKey{}, ingress{network, source, destination})
-}
-
-func WithEnhancedUID(ctx context.Context, request []byte) context.Context {
-	if flow, ok := ctx.Value(ingressKey{}).(ingress); ok {
-		if uid, found := EnhancedUID(flow.network, flow.source, flow.destination, request); found {
-			return context.WithValue(ctx, uidKey{}, observedUID{uid, "enhance"})
-		}
-	}
-	return ctx
-}
 
 type egressKey struct{}
 
@@ -112,7 +90,6 @@ type Observation struct {
 	start     time.Time
 	origin    Origin
 	uid       *uint32
-	uidSource string
 	queue     *eventQueue
 	lookupUID func() (uint32, bool)
 }
@@ -133,7 +110,6 @@ func Subscribe() (<-chan Event, func()) {
 	if active.Load() == nil {
 		queue := newEventQueue()
 		active.Store(queue)
-		setEnhancedUIDObservation(true)
 		go queue.run(publish)
 	}
 	stream.Unlock()
@@ -142,7 +118,6 @@ func Subscribe() (<-chan Event, func()) {
 		delete(stream.listeners, listener)
 		if len(stream.listeners) == 0 {
 			if queue := active.Swap(nil); queue != nil {
-				setEnhancedUIDObservation(false)
 				close(queue.done)
 			}
 		}
@@ -151,7 +126,7 @@ func Subscribe() (<-chan Event, func()) {
 }
 
 func WithUID(ctx context.Context, uid uint32) context.Context {
-	return context.WithValue(ctx, uidKey{}, observedUID{uid, "socket"})
+	return context.WithValue(ctx, uidKey{}, uid)
 }
 
 func WithUIDLookup(ctx context.Context, lookup func() (uint32, bool)) context.Context {
@@ -164,10 +139,8 @@ func Start(ctx context.Context, query *D.Msg) (context.Context, *Observation) {
 		return ctx, nil
 	}
 	o := &Observation{start: time.Now(), queue: queue}
-	if uid, ok := ctx.Value(uidKey{}).(observedUID); ok {
-		if uid.uid != UnknownEnhancedUID {
-			o.uid, o.uidSource = &uid.uid, uid.source
-		}
+	if uid, ok := ctx.Value(uidKey{}).(uint32); ok {
+		o.uid = &uid
 	} else if lookup, ok := ctx.Value(uidLookupKey{}).(func() (uint32, bool)); ok {
 		o.lookupUID = lookup
 	}
@@ -218,7 +191,7 @@ func (o *Observation) Finish(query *D.Msg, response *D.Msg, err error) {
 	q := query.Question[0]
 	event := Event{
 		Time: now.UnixMilli(), Delay: now.Sub(o.start).Milliseconds(),
-		Qname: q.Name, Qtype: q.Qtype, Status: "failed", UID: o.uid, UIDSource: o.uidSource,
+		Qname: q.Name, Qtype: q.Qtype, Status: "failed", UID: o.uid,
 		AnswerSource: o.origin.Source, origin: o.origin, lookupUID: o.lookupUID,
 		Route: o.origin.Route, OutboundTag: o.origin.OutboundTag,
 	}

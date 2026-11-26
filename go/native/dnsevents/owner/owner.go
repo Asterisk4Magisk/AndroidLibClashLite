@@ -37,10 +37,9 @@ func ForFlow(ctx context.Context, network string, source, destination netip.Addr
 	})
 }
 
-// PrepareMetadata snapshots the endpoints and known owner of a DNS outbound.
+// PrepareMetadata snapshots the known UID of a DNS outbound.
 // A receiver uses the snapshot only when it starts observing a message.
 func PrepareMetadata(metadata *C.Metadata) func(context.Context) context.Context {
-	network, source, destination := metadata.NetWork, metadata.SourceAddrPort(), metadata.AddrPort()
 	uid, known := metadata.Uid, metadata.Uid != 0 && metadata.Uid != flowmeta.UnknownUID
 	if owner, ok := metadata.RawSrcAddr.(interface{ FlowUID() uint32 }); ok {
 		if original := owner.FlowUID(); original != flowmeta.UnknownUID {
@@ -49,9 +48,6 @@ func PrepareMetadata(metadata *C.Metadata) func(context.Context) context.Context
 		}
 	}
 	return func(ctx context.Context) context.Context {
-		if environment.IsCLI {
-			ctx = dnsevents.WithIngress(ctx, network.String(), source, destination)
-		}
 		if known {
 			ctx = dnsevents.WithUID(ctx, uid)
 		}

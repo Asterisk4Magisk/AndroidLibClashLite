@@ -24,18 +24,14 @@ pub(crate) async fn handle(request: Request, home: &Path) -> Response {
         )
             .into_response();
     }
-    #[cfg(target_os = "android")]
-    let observation = crate::dns_uid::observe();
-    #[cfg(not(target_os = "android"))]
-    let observation = ();
     let stream = futures::stream::unfold(
-        (meow_dns::events::subscribe(), observation),
-        |(mut subscription, observation)| async move {
+        meow_dns::events::subscribe(),
+        |mut subscription| async move {
             loop {
                 let event = subscription.recv().await?;
                 if let Ok(mut line) = serde_json::to_vec(event.as_ref()) {
                     line.push(b'\n');
-                    return Some((Ok::<_, Infallible>(line), (subscription, observation)));
+                    return Some((Ok::<_, Infallible>(line), subscription));
                 }
             }
         },

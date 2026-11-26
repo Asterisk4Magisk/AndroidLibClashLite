@@ -38,9 +38,7 @@ Keep this ordering when adding or renumbering patches.
   selection logic without updating group usage, selection, or health state.
 - `0008-dns-events.patch` observes completed DNS responses and preserves the
   source of the selected reply across the resolver pipeline.
-- `0009-enhancement-dns-uid.patch` supplies original flow endpoints and query
-  bytes to the standalone DNS event UID lookup.
-- `0010-dns-event-delivery.patch` queues event formatting and UID lookups
+- `0009-dns-event-delivery.patch` queues event formatting and UID lookups
   separately from DNS replies while the controller has a subscriber.
   In-flight UID lookups use a bounded wait outside the formatting worker.
 

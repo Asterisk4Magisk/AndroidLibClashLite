@@ -478,7 +478,6 @@ def patch_dns_events(patch):
     patch(relay, '\tr, err := ServeMsg(ctx, msg)',
           '\tif dnsevents.Enabled() {\n'
           '\t\tif prepareOwner != nil {\n\t\t\tctx = prepareOwner(ctx)\n\t\t}\n'
-          '\t\tctx = dnsevents.WithEnhancedUID(ctx, payload)\n'
           '\t}\n'
           '\tctx, observation := dnsevents.Start(ctx, msg)\n\tr, err := ServeMsg(ctx, msg)')
     patch(relay, '\t\treturn m.PackBuffer(target)',

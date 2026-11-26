@@ -126,9 +126,8 @@ loopback controller. Send the usual controller credentials and
   `status`. Times are in milliseconds. Replies add `rcode` and `answers`.
   A timed-out Mihomo query can include the SERVFAIL reply's `rcode`.
   `answerSource`, `upstream`, `uid`, `uidSource`, `route` and `outboundTag`
-  are optional. `uidSource` is `enhance` for the original UID from
-  AsteriskEnhance or `socket` for connection ownership. In ROOT, a matching
-  AsteriskEnhance UID takes precedence. Open the stream only while collecting.
+  are optional. `uidSource` is `socket` when connection ownership supplies a UID.
+  Open the stream only while collecting.
   Delivery is best effort and events can be dropped under load. Mihomo limits
   its event answer list to 64 records or 8 KiB of uncompressed DNS record data.
 

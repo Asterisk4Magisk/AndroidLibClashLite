@@ -406,9 +406,9 @@ async fn abort_flow_tasks(flow_tasks: &FlowTasks) {
 
 static DNS_UID_BUDGET: Semaphore = Semaphore::const_new(DNS_BURST_CAP);
 
-fn tcp_dns_owner(source: SocketAddr, destination: SocketAddr) -> impl FnMut(&[u8]) -> QueryUid {
+fn tcp_dns_owner(source: SocketAddr, destination: SocketAddr) -> impl FnMut() -> QueryUid {
     let mut connection: Option<tokio::sync::watch::Receiver<Option<Option<u32>>>> = None;
-    move |_| {
+    move || {
         if !meow_dns::events::enabled() {
             return QueryUid::Known(None);
         }
