@@ -44,6 +44,8 @@ Keep this ordering when adding or renumbering patches.
   during the core session and replays them before live events. It reuses
   parsed questions for simple address queries and publishes deferred UID
   results directly to the same history and live feed.
+- `0011-dns-tcp-frame-write.patch` sends the TCP DNS length prefix and
+  payload together to avoid waiting on a delayed ACK between them.
 
 Preparation checks every patch against the pinned sources before applying it.
 When updating the pin, review and regenerate these patches, then run the Android

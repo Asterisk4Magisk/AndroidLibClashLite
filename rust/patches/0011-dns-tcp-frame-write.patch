@@ -1,0 +1,24 @@
+diff --git a/crates/meow-dns/src/client.rs b/crates/meow-dns/src/client.rs
+--- a/crates/meow-dns/src/client.rs
++++ b/crates/meow-dns/src/client.rs
+@@ -11,6 +11,7 @@
+ use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+ use hickory_proto::rr::{Name, RData, Record, RecordType};
+ use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
++use smallvec::SmallVec;
+ use std::collections::{hash_map::Entry, HashMap, HashSet};
+ use std::future::Future;
+ use std::io;
+@@ -2783,7 +2784,10 @@
+ async fn write_lp<W: AsyncWriteExt + Unpin>(w: &mut W, payload: &[u8]) -> io::Result<()> {
+     let len =
+         u16::try_from(payload.len()).map_err(|_| io::Error::other("dns message too large"))?;
+-    w.write_all(&len.to_be_bytes()).await?;
+-    w.write_all(payload).await?;
++    // A separate two-byte write can leave the payload waiting on a delayed ACK.
++    let mut frame = SmallVec::<[u8; 512]>::with_capacity(payload.len() + 2);
++    frame.extend_from_slice(&len.to_be_bytes());
++    frame.extend_from_slice(payload);
++    w.write_all(&frame).await?;
+     w.flush().await
+ }
