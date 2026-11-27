@@ -110,15 +110,20 @@ isolated validation executes the sibling `libmeow.so`.
 - UID and package snapshots feed UID/PROCESS-NAME rules before dispatch.
   Standalone ROOT uses `/proc/net` and `/data/system/packages.list`; ordinary
   JNI VPN sessions use Android callbacks and never start the ROOT DNS helper.
+- The fetch options JSON accepts a `requestHeaders` object of string names and
+  values for the primary subscription, including `x-hwid`. A custom
+  `Authorization` overrides URL Basic authentication. Providers use their own
+  headers. Crossing origins strips the primary request headers for the rest of
+  the redirect chain. HTTPS downgrades are rejected. The binding exposes
+  `supportsSubscriptionRequestHeaders()` and the `subscriptionRequestHeaders`
+  flag in its capabilities JSON.
 - `fetchAndValid` handles HTTP(S), authenticated SOCKS5 download proxies, local
   files and owned `content://` descriptors. It reports existing status JSON,
   subscription usage/expiry/update interval/content-disposition, prefetches
   provider files, and preserves provider usage sidecars. Cancellation interrupts
   HTTP/content reads and the validator child, completing the task once.
-  HWID is sent only on the primary subscription request, removed permanently
-  on cross-origin redirects, and rejected on HTTPS downgrade. Denial headers
-  yield `HWID_LIMIT_REACHED` or `HWID_NOT_SUPPORTED` without reading the body;
-  malformed identities yield `HWID_INVALID`.
+  HWID denial headers yield `HWID_LIMIT_REACHED` or `HWID_NOT_SUPPORTED` before
+  reading the response body.
 - `setAgeSecretKey`, `decryptAge` and `veritySecretKeys` support multiline X25519
   identity files with comments. CLI also reads `CLASH_AGE_SECRET_KEY`.
 - Logs use `{level,message,time}` with millisecond timestamps. Traffic exposes

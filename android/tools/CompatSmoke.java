@@ -267,9 +267,9 @@ public final class CompatSmoke {
               3,
               new File(home, "http"),
               server.url(),
-              "{\"hwid\":\"0123456789-test\",\"userAgent\":\"meta-smoke\"}");
+              "{\"requestHeaders\":{\"X-Hwid\":\"vendor/device\"},\"userAgent\":\"meta-smoke\"}");
       fetch.await(true);
-      check(server.requests.get(0).contains("X-Hwid: 0123456789-test"), "HWID sent");
+      check(server.requests.get(0).contains("X-Hwid: vendor/device"), "custom HWID sent");
       JSONObject info =
           fetch.status.stream()
               .filter(v -> v.optString("action").equals("SubscriptionInfo"))
@@ -292,11 +292,12 @@ public final class CompatSmoke {
               4,
               new File(home, "redirect"),
               redirect.url().replace("http://", "http://user:pass@"),
-              "{\"hwid\":\"0123456789-test\"}");
+              "{\"requestHeaders\":{\"X-Hwid\":\"vendor/device\",\"X-Asterisk-Test\":\"enabled\"}}");
       fetch.await(true);
       check(
           !target.requests.get(0).toLowerCase().contains("x-hwid:")
-              && !target.requests.get(0).toLowerCase().contains("authorization:"),
+              && !target.requests.get(0).toLowerCase().contains("authorization:")
+              && !target.requests.get(0).toLowerCase().contains("x-asterisk-test:"),
           "cross-origin credential stripping");
     }
     try (Http denied = new Http(request -> response("x-hwid-limit: true\r\n", "denied"))) {
@@ -305,14 +306,6 @@ public final class CompatSmoke {
       check(fetch.error.equals("HWID_LIMIT_REACHED"), "exact HWID error: " + fetch.error);
     }
     CountDownLatch entered = new CountDownLatch(1), release = new CountDownLatch(1);
-    Done invalidHwid =
-        fetch(
-            9,
-            new File(home, "invalid-hwid"),
-            "http://subscription.invalid/profile",
-            "{\"hwid\":\"bad hwid\"}");
-    invalidHwid.await(false);
-    check(invalidHwid.error.equals("HWID_INVALID"), "invalid HWID error: " + invalidHwid.error);
     try (Http slow =
         new Http(
             request -> {

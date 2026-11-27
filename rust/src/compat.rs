@@ -26,7 +26,10 @@ pub fn command(operation: &str, input: &str) -> Result<String> {
                 ("controller", &["", "cubic"][..]),
             ] {
                 if !accepted.iter().any(|v| text(key).eq_ignore_ascii_case(v)) {
-                    tracing::warn!(field = key, "TUN option is ignored; using the existing lwIP stack and congestion behavior");
+                    tracing::warn!(
+                        field = key,
+                        "TUN option is ignored; using the existing lwIP stack and congestion behavior"
+                    );
                 }
             }
             Value::Null
@@ -94,19 +97,7 @@ pub fn command(operation: &str, input: &str) -> Result<String> {
 
 async fn fetch(args: &Value) -> Result<Value> {
     let mut url = url::Url::parse(args["url"].as_str().context("subscription URL")?)?;
-    let hwid = args["hwid"].as_str().unwrap_or("");
-    anyhow::ensure!(
-        hwid.is_empty()
-            || ((10..=64).contains(&hwid.len())
-                && hwid
-                    .bytes()
-                    .all(|v| v.is_ascii_alphanumeric() || matches!(v, b'=' | b'-'))),
-        "HWID_INVALID"
-    );
     let mut headers = Vec::new();
-    if !hwid.is_empty() {
-        headers.push(("X-Hwid".into(), hwid.into()));
-    }
     if let Some(ua) = args["userAgent"].as_str().filter(|v| !v.is_empty()) {
         headers.push(("User-Agent".into(), ua.into()));
     }
@@ -121,6 +112,40 @@ async fn fetch(args: &Value) -> Result<Value> {
         ));
         let _ = url.set_username("");
         let _ = url.set_password(None);
+    }
+    if let Some(custom_headers) = args["requestHeaders"].as_object() {
+        for (name, value) in custom_headers {
+            let value = value
+                .as_str()
+                .context("invalid subscription request header")?;
+            anyhow::ensure!(
+                !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c))
+                    && value
+                        .bytes()
+                        .all(|c| (b' '..=b'~').contains(&c) || c == b'\t'),
+                "invalid subscription request header"
+            );
+            anyhow::ensure!(
+                !matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    "host"
+                        | "connection"
+                        | "content-length"
+                        | "transfer-encoding"
+                        | "proxy-authorization"
+                        | "if-none-match"
+                        | "if-modified-since"
+                        | "user-agent"
+                        | "x-age-public-key"
+                ),
+                "managed subscription request header"
+            );
+            headers.retain(|(key, _): &(String, String)| !key.eq_ignore_ascii_case(name));
+            headers.push((name.clone(), value.into()));
+        }
     }
     let proxy =
         if args["proxy"].is_object() && !args["proxy"]["host"].as_str().unwrap_or("").is_empty() {

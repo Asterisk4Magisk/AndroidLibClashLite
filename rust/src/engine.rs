@@ -81,7 +81,7 @@ pub fn capabilities() -> String {
         "jni":true, "cli":true, "tunFd":cfg!(unix),
         "clashApi":true, "mixed":true, "socks5":true, "http":true, "proxyIpProbe":true, "dnsEvents":1,
         "rootTproxy":cfg!(target_os = "android"), "rootTun":false,
-        "age":true, "subscriptionHwid":true,
+        "age":true, "subscriptionRequestHeaders":true,
         "systemDns":true, "libclashFacade":true, "isolatedValidation":true,
         "dnsOutbound":true, "tunDnsTcp":true, "tunDnsUdp":true,
         "ageIdentities":["X25519"], "tunStacks":["lwip"], "selectableCongestionController":false,
@@ -95,7 +95,9 @@ pub fn capabilities() -> String {
 
 fn check_config(raw: &RawConfig) -> Result<()> {
     if raw.tun.as_ref().is_some_and(|tun| tun.enable) {
-        bail!("ROOT TUN is not supported by this binding; Android VPN must pass its TUN fd to startTun");
+        bail!(
+            "ROOT TUN is not supported by this binding; Android VPN must pass its TUN fd to startTun"
+        );
     }
     Ok(())
 }

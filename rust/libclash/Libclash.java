@@ -594,7 +594,7 @@ public final class Libclash {
     LOGS.remove(subscription);
   }
 
-  public static boolean supportsSubscriptionHwid() {
+  public static boolean supportsSubscriptionRequestHeaders() {
     return true;
   }
 

@@ -35,10 +35,10 @@ type FetchProxy struct {
 }
 
 type FetchOptions struct {
-	Force     bool        `json:"force"`
-	UserAgent string      `json:"userAgent"`
-	Hwid      string      `json:"hwid"`
-	Proxy     *FetchProxy `json:"proxy"`
+	Force          bool              `json:"force"`
+	UserAgent      string            `json:"userAgent"`
+	RequestHeaders map[string]string `json:"requestHeaders"`
+	Proxy          *FetchProxy       `json:"proxy"`
 }
 
 type Status struct {
@@ -63,8 +63,8 @@ type fetchHeader struct {
 	ContentDisposition    string
 }
 
-func openUrl(ctx context.Context, url string, userAgent string, hwid string, requestDialer C.Dialer) (io.ReadCloser, fetchHeader, error) {
-	response, err := subscription.Get(ctx, url, userAgent, hwid, requestDialer.DialContext)
+func openUrl(ctx context.Context, url string, userAgent string, requestHeaders map[string]string, requestDialer C.Dialer) (io.ReadCloser, fetchHeader, error) {
+	response, err := subscription.Get(ctx, url, userAgent, requestHeaders, requestDialer.DialContext)
 	if err != nil {
 		return nil, fetchHeader{}, err
 	}
@@ -80,7 +80,7 @@ func openContent(url string) (io.ReadCloser, error) {
 	return app.OpenContent(url)
 }
 
-func fetch(ctx context.Context, url *U.URL, file string, userAgent string, hwid string, requestDialer C.Dialer) (fetchHeader, error) {
+func fetch(ctx context.Context, url *U.URL, file string, userAgent string, requestHeaders map[string]string, requestDialer C.Dialer) (fetchHeader, error) {
 	if err := ctx.Err(); err != nil {
 		return fetchHeader{}, err
 	}
@@ -93,7 +93,7 @@ func fetch(ctx context.Context, url *U.URL, file string, userAgent string, hwid 
 
 	switch url.Scheme {
 	case "http", "https":
-		reader, header, err = openUrl(requestCtx, url.String(), userAgent, hwid, requestDialer)
+		reader, header, err = openUrl(requestCtx, url.String(), userAgent, requestHeaders, requestDialer)
 	case "content":
 		// Descriptor acquisition is synchronous in the Android resolver API.
 		// Once acquired, closing the descriptor can interrupt a blocked read.
@@ -228,7 +228,7 @@ func FetchAndValid(
 
 		reportStatus(string(bytes))
 
-		header, err := fetch(ctx, url, configPath, mainUserAgent, options.Hwid, requestDialer)
+		header, err := fetch(ctx, url, configPath, mainUserAgent, options.RequestHeaders, requestDialer)
 		if err != nil {
 			return err
 		}
@@ -321,7 +321,7 @@ func FetchAndValid(
 
 		// Match CMFA: provider prefetch is best-effort. Keep validating the
 		// configuration; Mihomo initializes and updates providers at runtime.
-		_, _ = fetch(ctx, url, ps, defaultUserAgent, "", requestDialer)
+		_, _ = fetch(ctx, url, ps, defaultUserAgent, nil, requestDialer)
 	})
 	if err := ctx.Err(); err != nil {
 		return err

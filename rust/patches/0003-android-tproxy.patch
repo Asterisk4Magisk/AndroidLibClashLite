@@ -233,7 +233,7 @@ index 655b4f2..63db442 100644
 +                }
                  if current.origin() != next.origin() {
                      headers.retain(|(name, _)| {
-+                        if subscription && name.eq_ignore_ascii_case("x-hwid") {
++                        if subscription && !name.eq_ignore_ascii_case("user-agent") {
 +                            return false;
 +                        }
                          ![

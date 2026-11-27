@@ -10,33 +10,38 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"regexp"
 	"strings"
 	"time"
 
 	"github.com/metacubex/http"
 	"github.com/metacubex/mihomo/component/ca"
+	"golang.org/x/net/http/httpguts"
 )
 
-var hwidPattern = regexp.MustCompile(`^[a-zA-Z0-9=-]{10,64}$`)
-
 // Get returns only successful configuration responses. The caller owns Body.
-// An empty hwid preserves anonymous/provider requests. Identity never crosses origins.
-func Get(ctx context.Context, rawURL, userAgent, hwid string, dial func(context.Context, string, string) (net.Conn, error)) (*http.Response, error) {
-	if hwid != "" && !hwidPattern.MatchString(hwid) {
-		return nil, errors.New("HWID_INVALID")
-	}
+// Request headers and URL credentials are scoped to the initial origin.
+func Get(ctx context.Context, rawURL, userAgent string, requestHeaders map[string]string, dial func(context.Context, string, string) (net.Conn, error)) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, errors.New("invalid subscription URL")
 	}
 	req.Header.Set("User-Agent", userAgent)
-	if hwid != "" {
-		req.Header.Set("X-Hwid", hwid)
-	}
 	if user := req.URL.User; user != nil {
 		password, _ := user.Password()
 		req.SetBasicAuth(user.Username(), password)
+	}
+	scopedHeaders := []string{"Authorization"}
+	for name, value := range requestHeaders {
+		if !httpguts.ValidHeaderFieldName(name) || !httpguts.ValidHeaderFieldValue(value) {
+			return nil, errors.New("invalid subscription request header")
+		}
+		switch strings.ToLower(name) {
+		case "host", "connection", "content-length", "transfer-encoding", "proxy-authorization",
+			"if-none-match", "if-modified-since", "user-agent", "x-age-public-key":
+			return nil, errors.New("managed subscription request header")
+		}
+		req.Header.Set(name, value)
+		scopedHeaders = append(scopedHeaders, name)
 	}
 	tlsConfig, err := ca.GetTLSConfig(ca.Option{})
 	if err != nil {
@@ -50,7 +55,9 @@ func Get(ctx context.Context, rawURL, userAgent, hwid string, dial func(context.
 		ExpectContinueTimeout: time.Second,
 	}
 	defer transport.CloseIdleConnections()
-	client := http.Client{Transport: transport, CheckRedirect: checkRedirect}
+	client := http.Client{Transport: transport, CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return checkRedirect(req, via, scopedHeaders)
+	}}
 	response, err := client.Do(req)
 	if err != nil {
 		var urlError *url.Error
@@ -75,7 +82,7 @@ func Get(ctx context.Context, rawURL, userAgent, hwid string, dial func(context.
 	return response, nil
 }
 
-func checkRedirect(req *http.Request, via []*http.Request) error {
+func checkRedirect(req *http.Request, via []*http.Request, scopedHeaders []string) error {
 	if len(via) >= 10 {
 		return errors.New("too many subscription redirects")
 	}
@@ -86,8 +93,9 @@ func checkRedirect(req *http.Request, via []*http.Request) error {
 	// Check the entire chain: an A -> B -> A redirect must not restore identity.
 	for _, prior := range via {
 		if !sameOrigin(prior.URL, req.URL) {
-			req.Header.Del("X-Hwid")
-			req.Header.Del("Authorization")
+			for _, name := range scopedHeaders {
+				req.Header.Del(name)
+			}
 			break
 		}
 	}

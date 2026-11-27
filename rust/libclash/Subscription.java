@@ -189,7 +189,7 @@ final class Subscription {
         JSONObject request =
             Libclash.object("id", id, "url", source, "proxy", options.opt("proxy"));
         if (primary) {
-          request.put("hwid", options.optString("hwid"));
+          request.put("requestHeaders", options.optJSONObject("requestHeaders"));
           request.put("userAgent", options.optString("userAgent"));
         }
         JSONObject response = (JSONObject) Libclash.nativeCall("http", request);

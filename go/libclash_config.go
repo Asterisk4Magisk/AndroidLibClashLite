@@ -23,8 +23,8 @@ type FetchCallback interface {
 	Complete(errorText string)
 }
 
-// SupportsSubscriptionHwid identifies bindings with scoped HWID and denial handling.
-func SupportsSubscriptionHwid() bool { return true }
+// SupportsSubscriptionRequestHeaders identifies bindings with scoped request headers.
+func SupportsSubscriptionRequestHeaders() bool { return true }
 
 var fetchTasks = struct {
 	sync.Mutex

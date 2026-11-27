@@ -11,7 +11,7 @@ func Snapshot() map[string]any {
 		"schemaVersion": 1, "core": "mihomo", "version": constant.Version,
 		"jni": true, "cli": true, "tunFd": true, "clashApi": true,
 		"mixed": true, "socks5": true, "http": true, "rootTproxy": true, "rootTun": true,
-		"age": true, "subscriptionHwid": true, "systemDns": true,
+		"age": true, "subscriptionRequestHeaders": true, "systemDns": true,
 		"libclashFacade": true, "isolatedValidation": false, "dnsOutbound": true,
 		"tunDnsTcp": true, "tunDnsUdp": true,
 		"dnsEvents":                      1,
